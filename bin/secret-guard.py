@@ -80,16 +80,33 @@ def load_json(path, default):
             return json.load(f)
     except FileNotFoundError:
         return default
-    except Exception as e:  # malformed config must not disable the guard silently
-        sys.stderr.write("secret-guard: cannot parse %s: %s\n" % (path, e))
-        return default
+    except (OSError, ValueError) as e:
+        raise ValueError("cannot read JSON state or configuration") from e
 
 
 def load_config():
     cfg = dict(DEFAULTS)
     user = load_json(os.path.join(guard_home(), "config.json"), {})
-    if isinstance(user, dict):
-        cfg.update(user)
+    if not isinstance(user, dict) or set(user) - set(DEFAULTS):
+        raise ValueError("configuration must be an object with recognised settings")
+    cfg.update(user)
+    for key, choices in {"prompt_policy": ("block", "off"),
+                         "compact_policy": ("warn", "block", "off"),
+                         "on_error": ("withhold", "passthrough")}.items():
+        if cfg[key] not in choices:
+            raise ValueError("invalid policy setting")
+    for key in ("ttl_hours", "max_scan_bytes", "scan_timeout_seconds"):
+        value = cfg[key]
+        if type(value) not in (int, float) or not 0 < value < float("inf"):
+            raise ValueError("invalid positive numeric setting")
+    if cfg["scan_timeout_seconds"] > 3:
+        raise ValueError("scan_timeout_seconds must not exceed 3")
+    for key in ("delete_on", "reinject_deny_tools", "disabled_patterns"):
+        if not isinstance(cfg[key], list) or not all(isinstance(s, str) for s in cfg[key]):
+            raise ValueError("invalid list setting")
+    for key in ("builtin_patterns", "log"):
+        if type(cfg[key]) is not bool:
+            raise ValueError("invalid boolean setting")
     return cfg
 
 
@@ -113,7 +130,7 @@ def read_list_file(path):
             else:
                 out.append(("literal", re.compile(re.escape(line))))
         except re.error as e:
-            sys.stderr.write("secret-guard: %s:%d bad regex: %s\n" % (path, n, e))
+            raise ValueError("invalid list regular expression at line %d" % n) from e
     return out
 
 
@@ -175,24 +192,36 @@ def build_detectors(cfg, cwd=None):
     dets = []
     disabled = set(cfg.get("disabled_patterns") or [])
 
-    def add_pattern_file(path):
-        data = load_json(path, {})
+    def add_pattern_file(path, required=False):
+        data = load_json(path, None)
+        if data is None and not required:
+            return
+        if not isinstance(data, dict) or not isinstance(data.get("patterns"), list):
+            raise ValueError("missing or invalid pattern file")
         for p in (data.get("patterns") or []):
+            if not isinstance(p, dict) or not all(isinstance(p.get(k), str) for k in ("id", "kind", "regex")):
+                raise ValueError("invalid detector definition")
             if p.get("id") in disabled:
                 continue
             flags = 0
             for ch in (p.get("flags") or ""):
-                flags |= FLAGS.get(ch, 0)
+                if ch not in FLAGS:
+                    raise ValueError("invalid detector flag")
+                flags |= FLAGS[ch]
             try:
                 rx = re.compile(p["regex"], flags)
             except (re.error, KeyError) as e:
-                sys.stderr.write("secret-guard: bad pattern %s: %s\n" % (p.get("id"), e))
-                continue
+                raise ValueError("invalid detector expression") from e
+            groups = p.get("group", 0)
+            for group in groups if isinstance(groups, list) else [groups]:
+                if not ((type(group) is int and 0 <= group <= rx.groups) or
+                        (isinstance(group, str) and group in rx.groupindex)):
+                    raise ValueError("invalid detector capture group")
             dets.append(Detector(p.get("id", "?"), p.get("kind", "secret"), rx,
                                  p.get("group", 0), bool(p.get("generic"))))
 
     if cfg.get("builtin_patterns", True):
-        add_pattern_file(os.path.join(PLUGIN_ROOT, "config", "patterns.json"))
+        add_pattern_file(os.path.join(PLUGIN_ROOT, "config", "patterns.json"), required=True)
     add_pattern_file(os.path.join(guard_home(), "patterns.json"))
 
     for path in list_files("denylist.txt", cwd):
@@ -266,9 +295,16 @@ class Vault(object):
         os.chmod(self.dir, 0o700)
         self._lock = os.fdopen(os.open(self.path + ".lock", os.O_WRONLY | os.O_CREAT, 0o600), "a")
         fcntl.flock(self._lock, fcntl.LOCK_EX)
-        self.data = load_json(self.path, None) or {
+        self.data = load_json(self.path, {
             "session_id": self.session_id, "created": now_iso(),
-            "updated": now_iso(), "entries": {}}
+            "updated": now_iso(), "entries": {}})
+        if not isinstance(self.data, dict) or self.data.get("session_id") != self.session_id \
+                or not isinstance(self.data.get("entries"), dict):
+            raise ValueError("invalid vault")
+        for ph, entry in self.data["entries"].items():
+            if not PLACEHOLDER_RE.fullmatch(ph) or not isinstance(entry, dict) \
+                    or not isinstance(entry.get("value"), str) or not entry["value"]:
+                raise ValueError("invalid vault entry")
         self._dirty = False
         return self
 
@@ -610,12 +646,9 @@ def on_pre_compact(inp, cfg):
     if policy == "off":
         return None
     sid = inp.get("session_id")
-    try:
-        with Vault(sid) as v:
-            entries = len(v.data.get("entries", {}))
-            files = list(v.data.get("files", []))
-    except ValueError:
-        return None
+    with Vault(sid) as v:
+        entries = len(v.data.get("entries", {}))
+        files = list(v.data.get("files", []))
     if not entries:
         return None
     log_event(cfg, sid, "pre-compact", trigger=inp.get("trigger"), policy=policy,
@@ -721,29 +754,30 @@ def run_hook():
     except Exception:
         emit({})
         return 0
-    cfg = load_config()
+    cfg = dict(DEFAULTS, compact_policy="block")
     ev = inp.get("hook_event_name")
     handler = HANDLERS.get(ev)
     if handler is None:
         emit({})
         return 0
     try:
+        cfg = load_config()
         with scan_deadline(cfg["scan_timeout_seconds"]):
             result = handler(inp, cfg)
         if ev == "PreCompact":
             return result or 0
         emit(result)
     except Exception as e:
-        log_event(cfg, inp.get("session_id"), "error", hook=ev, error=repr(e))
-        sys.stderr.write("secret-guard: %s handler failed: %r\n" % (ev, e))
+        log_event(cfg, inp.get("session_id"), "error", hook=ev, error=type(e).__name__)
+        sys.stderr.write("secret-guard: %s handler failed (%s)\n" % (ev, type(e).__name__))
         if ev == "PreCompact":
-            return 2 if isinstance(e, ScanTimeout) else 0
-        if isinstance(e, ScanTimeout) and ev == "UserPromptSubmit":
-            emit({"decision": "block", "reason": "secret-guard: inspection timed out"})
+            return 2 if cfg.get("compact_policy") == "block" else 0
+        if ev == "UserPromptSubmit":
+            emit({"decision": "block", "reason": "secret-guard: inspection failed"})
             return 0
-        if isinstance(e, ScanTimeout) and ev == "PreToolUse":
+        if ev == "PreToolUse":
             emit({"hookSpecificOutput": {"hookEventName": ev, "permissionDecision": "deny",
-                                         "permissionDecisionReason": "secret-guard: inspection timed out"}})
+                                         "permissionDecisionReason": "secret-guard: inspection failed"}})
             return 0
         if ev == "PostToolUse" and cfg.get("on_error", "withhold") == "withhold" \
                 and inp.get("tool_response") is not None:
