@@ -484,6 +484,122 @@ class Lifecycle(Base):
         self.assertEqual(json.loads(buf.getvalue()), {})
 
 
+class ReferencedFiles(Base):
+    def write_file(self, name, content):
+        path = os.path.join(self.home, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return path
+
+    def prompt(self, text):
+        return self.hook({"hook_event_name": "UserPromptSubmit", "session_id": SID_A,
+                          "cwd": self.home, "prompt": text})
+
+    def configure(self, **cfg):
+        self.write_file("config.json", json.dumps(cfg))
+
+    def assert_reference_blocked(self, result):
+        self.assertEqual(result["decision"], "block")
+        self.assertIn('"inspect_referenced_files": false', result["reason"])
+        self.assertIn(os.path.join(self.home, "config.json"), result["reason"])
+        self.assertIn("without @", result["reason"])
+        self.assertNotIn(GLPAT, json.dumps(result))
+
+    def test_default_blocks_secret_file_without_echoing_or_modifying_it(self):
+        path = self.write_file("secrets.env", "ACCESS_TOKEN=" + GLPAT)
+        self.assertTrue(self.cfg["inspect_referenced_files"])
+        self.assert_reference_blocked(self.prompt("Review @secrets.env"))
+        with open(path) as f:
+            self.assertEqual(f.read(), "ACCESS_TOKEN=" + GLPAT)
+        with open(os.path.join(self.home, "secret-guard.log")) as f:
+            self.assertNotIn(GLPAT, f.read())
+
+    def test_clean_file_plain_path_and_email_pass(self):
+        self.write_file("clean.txt", "ordinary documentation")
+        self.write_file("secrets.env", GLPAT)
+        for prompt in ["Review @clean.txt", "Use Read to inspect secrets.env", "Contact name@example.com"]:
+            self.assertEqual(self.prompt(prompt), {}, prompt)
+
+    def test_absolute_quoted_escaped_and_line_references(self):
+        path = self.write_file("secret file.env", GLPAT)
+        self.write_file("secret.env", GLPAT)
+        for reference in ['@"' + path + '"', "@'secret file.env'", r"@secret\ file.env",
+                          "@secret.env:1-3", "@secret.env#L1-L3", "(@secret.env)", "`@secret.env`", "@secret.env,"]:
+            with self.subTest(reference=reference):
+                self.assert_reference_blocked(self.prompt("Review " + reference))
+        with patch.object(sg.os.path, "expanduser", side_effect=lambda p: p.replace("~/", self.home + "/")):
+            self.assert_reference_blocked(self.prompt("Review @~/secret.env"))
+
+    def test_multiple_references_and_symlinks(self):
+        self.write_file("clean.txt", "ordinary documentation")
+        path = self.write_file("secret.env", GLPAT)
+        os.symlink(path, os.path.join(self.home, "linked.env"))
+        self.assert_reference_blocked(self.prompt("Review @clean.txt and @linked.env"))
+
+    def test_disabling_file_check_keeps_pasted_text_protected(self):
+        self.write_file("secret.env", GLPAT)
+        self.configure(inspect_referenced_files=False)
+        self.assertEqual(self.prompt("Review @secret.env"), {})
+        self.assertEqual(self.prompt("Use " + GLPAT)["decision"], "block")
+        self.configure(prompt_policy="off")
+        self.assert_reference_blocked(self.prompt("Review @secret.env"))
+
+    def test_denylist_allowlist_known_values_and_entropy(self):
+        self.write_file("data.txt", "Sup3rS3cret!")
+        self.assert_reference_blocked(self.prompt("Review @data.txt"))
+        self.write_file("allowlist.txt", "Sup3rS3cret!\n")
+        self.assertEqual(self.prompt("Review @data.txt"), {})
+        self.post(SID_A, "Bash", {"stdout": "password=CorrectHorseBatteryStaple9!"})
+        self.write_file("data.txt", "CorrectHorseBatteryStaple9!")
+        self.assert_reference_blocked(self.prompt("Review @data.txt"))
+        self.write_file("data.txt", "mQ7rT9xB2vN8kL5zW3cH6jP4sD1fG0aY")
+        self.configure(entropy_detection=True)
+        self.assert_reference_blocked(self.prompt("Review @data.txt"))
+
+    def test_project_rules_apply(self):
+        self.write_file(".claude/secret-guard/denylist.txt", "ProjectPrivateWord\n")
+        self.write_file("data.txt", "ProjectPrivateWord")
+        self.assert_reference_blocked(self.prompt("Review @data.txt"))
+
+    def test_ancestor_context_is_inspected(self):
+        self.write_file("docs/clean.txt", "ordinary documentation")
+        self.write_file("CLAUDE.md", GLPAT)
+        self.assert_reference_blocked(self.prompt("Review @docs/clean.txt"))
+
+    def test_symlink_reference_inspects_context_at_link_location(self):
+        target = self.write_file("target/clean.txt", "ordinary documentation")
+        self.write_file("link/CLAUDE.md", GLPAT)
+        os.symlink(target, os.path.join(self.home, "link", "clean.txt"))
+        self.assert_reference_blocked(self.prompt("Review @link/clean.txt"))
+
+    def test_uninspectable_references_fail_closed_with_guidance(self):
+        self.write_file("binary.dat", "hello\x00world")
+        os.mkfifo(os.path.join(self.home, "pipe"))
+        for ref in ["@missing.env", "@binary.dat", "@pipe", "@.", "@server:resource", '@"unclosed']:
+            self.assert_reference_blocked(self.prompt("Review " + ref))
+        with patch.object(sg, "inspect_references", side_effect=PermissionError("sensitive path")):
+            result = self.prompt("Review @file")
+            self.assert_reference_blocked(result)
+            self.assertNotIn("sensitive path", json.dumps(result))
+        with patch.object(sg, "inspect_references", side_effect=sg.ScanTimeout()):
+            self.assert_reference_blocked(self.prompt("Review @file"))
+
+    def test_total_byte_budget_and_duplicate_references(self):
+        self.write_file("a.txt", "a" * 60)
+        self.write_file("b.txt", "b" * 60)
+        self.configure(max_scan_bytes=100)
+        self.assertEqual(self.prompt("Review @a.txt @a.txt"), {})
+        self.assert_reference_blocked(self.prompt("Review @a.txt @b.txt"))
+        self.write_file("large.txt", "a" * 101)
+        self.assert_reference_blocked(self.prompt("Review @large.txt"))
+
+    def test_setting_requires_boolean(self):
+        self.configure(inspect_referenced_files="false")
+        with self.assertRaises(ValueError):
+            sg.load_config()
+
+
 class ProcessIntegration(Base):
     def run_process(self, payload=None, args=None, text=None):
         result = subprocess.run([sys.executable, os.path.join(ROOT, "bin", "secret-guard.py")]
@@ -530,6 +646,15 @@ class ProcessIntegration(Base):
         self.run_process(args=["purge", "--all"])
         self.assertFalse(os.path.exists(os.path.join(self.home, "vault", SID_A + ".json")))
         self.assertTrue(os.path.exists(os.path.join(self.home, "vault", SID_A + ".json.lock")))
+
+    def test_referenced_secret_is_blocked_by_real_hook(self):
+        with open(os.path.join(self.home, "secret.env"), "w") as f:
+            f.write(GLPAT)
+        result = self.run_process({"hook_event_name": "UserPromptSubmit", "session_id": SID_A,
+                                   "cwd": self.home, "prompt": "Review @secret.env"})
+        self.assertEqual(json.loads(result.stdout)["decision"], "block")
+        self.assertIn("inspect_referenced_files", result.stdout)
+        self.assertNotIn(GLPAT, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":
