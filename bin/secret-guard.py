@@ -352,6 +352,14 @@ class Vault(object):
     def touch(self):
         self._dirty = True
 
+    def refresh_activity(self):
+        """Refresh existing state on ordinary session activity, without rewriting secrets."""
+        with self._acquire_lock():
+            try:
+                os.utime(self.path, None)
+            except FileNotFoundError:
+                pass
+
     def placeholder_for(self, value, kind, tool):
         entries = self.data["entries"]
         for ph, e in entries.items():
@@ -791,6 +799,8 @@ def run_hook():
     try:
         cfg = load_config()
         with scan_deadline(cfg["scan_timeout_seconds"]):
+            if ev in ("PreToolUse", "PostToolUse", "PostToolUseFailure", "UserPromptSubmit", "PreCompact"):
+                Vault(inp.get("session_id")).refresh_activity()
             result = handler(inp, cfg)
         if ev == "PreCompact":
             return result or 0
