@@ -231,12 +231,12 @@ def find_secrets(text, detectors, allowlist, known_values=()):
             hits.append((start, end, d.kind, d.id))
     hits.sort(key=lambda h: (h[0], -h[1]))
     out = []
-    last_end = -1
     for h in hits:
-        if h[0] < last_end:
-            continue                      # overlaps the previous (earlier/longer) hit
-        out.append(h)
-        last_end = h[1]
+        if out and h[0] < out[-1][1]:
+            previous = out[-1]
+            out[-1] = (previous[0], max(previous[1], h[1]), previous[2], previous[3])
+        else:
+            out.append(h)
     return out
 
 

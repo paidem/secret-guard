@@ -126,6 +126,16 @@ class Detection(Base):
         self.assertEqual(len(hits), 1)
         self.assertEqual(text[hits[0][0]:hits[0][1]], GLPAT)
 
+    def test_overlapping_matches_cover_entire_union_and_roundtrip(self):
+        value = "prefix " + GLPAT + " suffix"
+        dets = [sg.Detector("a", "denylist", re.compile(re.escape("prefix " + GLPAT[:10]))),
+                sg.Detector("b", "token", re.compile(re.escape(GLPAT))),
+                sg.Detector("c", "denylist", re.compile(re.escape(GLPAT[-8:] + " suffix")))]
+        with sg.Vault(SID_A) as vault:
+            redacted, _ = sg.redact_text(value, vault, dets, [], "Bash")
+            self.assertTrue(sg.PLACEHOLDER_RE.fullmatch(redacted))
+            self.assertEqual(vault.resolve(redacted), value)
+
 
 class RoundTrip(Base):
     def test_known_secret_without_original_context(self):
