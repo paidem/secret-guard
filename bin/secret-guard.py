@@ -423,10 +423,30 @@ def files_touched(tool, tool_input, cwd):
     return out
 
 
-def withhold(obj, reason):
+def withhold(obj, reason, tool):
+    """Build a replacement only for output schemas we know how to preserve."""
     msg = "[secret-guard: tool output withheld — %s]" % reason
-    new, _ = deep_map(obj, lambda s: msg if s else s)
-    return new
+    if tool.startswith("mcp__"):
+        return [{"type": "text", "text": msg}]
+    if tool == "Bash" and isinstance(obj, dict) and isinstance(obj.get("stdout"), str):
+        new, _ = deep_map(obj, lambda s: msg if s else s)
+        return new
+    if tool == "Read" and isinstance(obj, dict) and obj.get("type") == "text" \
+            and isinstance(obj.get("file"), dict):
+        new, _ = deep_map(obj, lambda s: msg if s else s)
+        new["type"] = "text"
+        return new
+    return None
+
+
+def withheld_response(inp, reason):
+    replacement = withhold(inp.get("tool_response"), reason, inp.get("tool_name", ""))
+    if replacement is None:
+        # An invalid replacement is ignored by Claude Code. Stop this turn instead.
+        return {"continue": False, "stopReason": "secret-guard: " + reason +
+                "; cannot safely replace this tool's output. Do not resume with this result."}
+    return {"hookSpecificOutput": {"hookEventName": "PostToolUse",
+                                    "updatedToolOutput": replacement}}
 
 
 # ------------------------------------------------------------------------------ logging
@@ -463,9 +483,7 @@ def on_post_tool_use(inp, cfg):
     size = len(json.dumps(resp))
     if size > int(cfg["max_scan_bytes"]):
         log_event(cfg, sid, "withheld", tool=tool, reason="too-large", bytes=size)
-        return {"hookSpecificOutput": {
-            "hookEventName": "PostToolUse",
-            "updatedToolOutput": withhold(resp, "%d bytes exceeds max_scan_bytes; narrow the command" % size)}}
+        return withheld_response(inp, "%d bytes exceeds max_scan_bytes; narrow the command" % size)
     detectors = build_detectors(cfg, inp.get("cwd"))
     allowlist = build_allowlist(inp.get("cwd"))
     kinds_all = []
@@ -675,9 +693,7 @@ def run_hook():
             return 0
         if ev == "PostToolUse" and cfg.get("on_error", "withhold") == "withhold" \
                 and inp.get("tool_response") is not None:
-            emit({"hookSpecificOutput": {
-                "hookEventName": "PostToolUse",
-                "updatedToolOutput": withhold(inp["tool_response"], "redaction failed: %r" % e)}})
+            emit(withheld_response(inp, "redaction failed"))
         else:
             emit({})
     return 0
