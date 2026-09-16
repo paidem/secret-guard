@@ -114,6 +114,17 @@ class Detection(Base):
 
 
 class RoundTrip(Base):
+    def test_withholding_preserves_read_and_mcp_schemas(self):
+        for tool, resp in [("Read", {"type": "text", "file": {"content": GLPAT, "numLines": 1}}),
+                           ("mcp__x__get", [{"type": "text", "text": GLPAT}])]:
+            result = sg.withheld_response({"tool_name": tool, "tool_response": resp}, "test")
+            new = result["hookSpecificOutput"]["updatedToolOutput"]
+            self.assertNotIn(GLPAT, json.dumps(new))
+            self.assertEqual((new[0] if isinstance(new, list) else new)["type"], "text")
+        result = sg.withheld_response({"tool_name": "Unknown", "tool_response": GLPAT}, "test")
+        self.assertIs(result["continue"], False)
+        self.assertNotIn("updatedToolOutput", json.dumps(result))
+
     def test_bash_redact_then_reinject(self):
         out = self.post(SID_A, "Bash", {"stdout": "token=" + GLPAT + "\n", "stderr": "", "interrupted": False})
         new = out["hookSpecificOutput"]["updatedToolOutput"]
