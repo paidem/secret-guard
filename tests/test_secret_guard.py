@@ -269,6 +269,20 @@ class RoundTrip(Base):
 
 
 class Lifecycle(Base):
+    def test_ordinary_session_activity_prevents_expiration(self):
+        self.post(SID_A, "Bash", {"stdout": GLPAT})
+        path = self.vault_path(SID_A)
+        for payload in [
+            {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "ls"}},
+            {"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_response": {"stdout": "hello"}},
+            {"hook_event_name": "UserPromptSubmit", "prompt": "continue"}]:
+            old = time.time() - 25 * 3600
+            os.utime(path, (old, old))
+            self.hook(dict(payload, session_id=SID_A))
+            self.hook({"hook_event_name": "SessionStart", "session_id": SID_B})
+            self.assertTrue(os.path.exists(path))
+            self.assertGreater(os.stat(path).st_mtime, time.time() - 60)
+
     def test_cleanup_serializes_with_writer_and_keeps_lock_inode(self):
         self.post(SID_A, "Bash", {"stdout": GLPAT})
         path = self.vault_path(SID_A)
