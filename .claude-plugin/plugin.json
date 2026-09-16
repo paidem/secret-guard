@@ -1,0 +1,12 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "secret-guard",
+  "version": "0.1.0",
+  "description": "Reversible secret redaction: tool results show [SECRET_…] placeholders, the real value is substituted back into tool calls within the same session, and the mapping expires.",
+  "author": {
+    "name": "Pavel Paidem",
+    "email": "pavel.paidem@gmail.com"
+  },
+  "homepage": "https://github.com/paidem/secret-guard",
+  "keywords": ["security", "secrets", "redaction", "hooks"]
+}
