@@ -138,7 +138,9 @@ def value_is_noise(v):
     """Values the generic rules must not treat as secrets."""
     if not v:
         return True
-    if v[0] in "$<{%*[@":
+    if PLACEHOLDER_RE.fullmatch(v) or re.fullmatch(
+            r"\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*|"
+            r"<[A-Za-z_][A-Za-z0-9_-]*>|\{\{[^{}]+\}\}", v):
         return True
     if VALUE_NOISE.match(v):
         return True
@@ -158,7 +160,8 @@ class Detector(object):
     def find(self, text):
         for m in self.regex.finditer(text):
             try:
-                start, end = m.span(self.group)
+                groups = self.group if isinstance(self.group, list) else [self.group]
+                start, end = next((m.span(g) for g in groups if m.start(g) >= 0), (-1, -1))
             except (IndexError, re.error):
                 start, end = m.span(0)
             if start < 0 or end <= start:

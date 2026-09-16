@@ -56,6 +56,17 @@ class Base(unittest.TestCase):
 
 
 class Detection(Base):
+    def test_quoted_and_punctuation_passwords(self):
+        for value in ["aB3defGhiJk;RemainingSecret", "@realPass123!", "$realPass123!",
+                      "aB3 def,Ghi&Jk", "abc'defghi123", 'abc\\"defghi123']:
+            for prefix in ['password="', '--password "', '--password="']:
+                text = prefix + value + '"'
+                hits = self.find(text)
+                self.assertEqual(len(hits), 1, text)
+                self.assertEqual(text[hits[0][0]:hits[0][1]], value, text)
+        for value in ["${DB_PASSWORD}", "$DB_PASSWORD", "<your-password>"]:
+            self.assertFalse(self.find("password=" + value))
+
     def test_long_non_secret_scan_and_regex_deadline(self):
         with sg.scan_deadline(2):
             self.assertFalse(self.find("A" * 100000))
