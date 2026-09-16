@@ -234,6 +234,7 @@ class RoundTrip(Base):
         self.assertEqual(new["stderr"], "")
         self.assertIs(new["interrupted"], False)
         self.assertIn("1 value(s)", out["hookSpecificOutput"]["additionalContext"])
+        self.assertIn("gitlab-token", out["hookSpecificOutput"]["additionalContext"])
         # reinject into Bash, Write, Edit and a nested MCP argument
         for tool, ti, path in [
             ("Bash", {"command": "curl -H 'PRIVATE-TOKEN: %s' https://x" % ph}, ("command",)),
