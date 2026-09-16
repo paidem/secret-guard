@@ -1,5 +1,7 @@
 # secret-guard
 
+![secret-guard demo](https://github.com/paidem/secret-guard/releases/download/demo-assets/secret-guard-demo.gif)
+
 Claude Code plugin: secrets in tool results are replaced by placeholders before the model
 sees them, the real value is put back when the placeholder appears in a later tool call, the
 mapping lives per session and expires.
