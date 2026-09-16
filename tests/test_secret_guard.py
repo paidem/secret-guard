@@ -12,6 +12,8 @@ import time
 import unittest
 import re
 import threading
+import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 from contextlib import redirect_stdout
 
@@ -29,8 +31,9 @@ GHP = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
 class Base(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.mkdtemp(prefix="sg-test-")
-        os.environ["SECRET_GUARD_HOME"] = self.home
-        os.environ["CLAUDE_PLUGIN_ROOT"] = ROOT
+        env = patch.dict(os.environ, {"SECRET_GUARD_HOME": self.home, "CLAUDE_PLUGIN_ROOT": ROOT})
+        env.start()
+        self.addCleanup(env.stop)
         sg.PLUGIN_ROOT = ROOT
         with open(os.path.join(self.home, "denylist.txt"), "w") as f:
             f.write("# test\nSup3rS3cret!\nci:HunterTwo\nre:CLIENT-[0-9]{4}\n")
@@ -40,11 +43,9 @@ class Base(unittest.TestCase):
         shutil.rmtree(self.home, ignore_errors=True)
 
     def hook(self, payload):
-        sys.stdin = io.StringIO(json.dumps(payload))
         buf = io.StringIO()
-        with redirect_stdout(buf):
+        with patch.object(sys, "stdin", io.StringIO(json.dumps(payload))), redirect_stdout(buf):
             sg.run_hook()
-        sys.stdin = sys.__stdin__
         return json.loads(buf.getvalue().strip() or "{}")
 
     def post(self, sid, tool, resp, cwd=None):
@@ -366,7 +367,8 @@ class Lifecycle(Base):
         self.post(SID_A, "Bash", {"stdout": GLPAT})
         self.assertEqual(os.stat(self.vault_path(SID_A)).st_mode & 0o777, 0o600)
         self.assertEqual(os.stat(os.path.join(self.home, "vault")).st_mode & 0o777, 0o700)
-        data = json.load(open(self.vault_path(SID_A)))
+        with open(self.vault_path(SID_A)) as f:
+            data = json.load(f)
         self.assertEqual(list(data["entries"].values())[0]["value"], GLPAT)
 
     def test_session_end_deletes_on_clear_only(self):
@@ -408,7 +410,8 @@ class Lifecycle(Base):
 
     def test_log_never_contains_values(self):
         self.post(SID_A, "Bash", {"stdout": "pw=" + GLPAT})
-        log = open(os.path.join(self.home, "secret-guard.log")).read()
+        with open(os.path.join(self.home, "secret-guard.log")) as f:
+            log = f.read()
         self.assertIn("redacted", log)
         self.assertNotIn(GLPAT, log)
 
@@ -459,7 +462,8 @@ class Lifecycle(Base):
         self.hook({"hook_event_name": "PostToolUse", "session_id": SID_A, "tool_name": "Bash", "cwd": proj,
                    "tool_input": {"command": "cd x && cat ./secrets.env | head -1; ls"},
                    "tool_response": {"stdout": "T=" + GLPAT, "stderr": ""}})
-        data = json.load(open(self.vault_path(SID_A)))
+        with open(self.vault_path(SID_A)) as f:
+            data = json.load(f)
         self.assertEqual(data["files"], [os.path.join(proj, "secrets.env")])
         self.assertEqual(sg.files_touched("Bash", {"command": "cat $HOME/x -n missing.txt"}, proj), [])
         self.assertEqual(sg.files_touched("Read", {"file_path": "/a"}, proj), ["/a"])
@@ -477,6 +481,54 @@ class Lifecycle(Base):
             sg.run_hook()
         sys.stdin = sys.__stdin__
         self.assertEqual(json.loads(buf.getvalue()), {})
+
+
+class ProcessIntegration(Base):
+    def run_process(self, payload=None, args=None, text=None):
+        result = subprocess.run([sys.executable, os.path.join(ROOT, "bin", "secret-guard.py")]
+                                + (args or ["hook"]), input=json.dumps(payload) if payload is not None else text,
+                                capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result
+
+    def test_pathological_regex_is_interrupted_in_real_hook(self):
+        with open(os.path.join(self.home, "patterns.json"), "w") as f:
+            json.dump({"patterns": [{"id": "slow", "kind": "test", "regex": "(a+)+$"}]}, f)
+        with open(os.path.join(self.home, "config.json"), "w") as f:
+            json.dump({"scan_timeout_seconds": 0.05}, f)
+        result = self.run_process({"hook_event_name": "PostToolUse", "session_id": SID_A,
+                                   "tool_name": "Read", "tool_response": {
+                                       "type": "text", "file": {"content": "a" * 100 + "!" + GLPAT}}})
+        response = json.loads(result.stdout)["hookSpecificOutput"]["updatedToolOutput"]
+        self.assertEqual(response["type"], "text")
+        self.assertIn("withheld", response["file"]["content"])
+        self.assertIn("ScanTimeout", result.stderr)
+        self.assertNotIn(GLPAT, result.stdout + result.stderr)
+
+    def test_concurrent_hook_writers_preserve_all_entries(self):
+        values = [GLPAT + str(n) for n in range(8)]
+        def write(value):
+            return self.run_process({"hook_event_name": "PostToolUse", "session_id": SID_A,
+                                     "tool_name": "Bash", "tool_response": {"stdout": value}})
+        with ThreadPoolExecutor(max_workers=8) as workers:
+            results = list(workers.map(write, values))
+        with open(os.path.join(self.home, "vault", SID_A + ".json")) as f:
+            entries = json.load(f)["entries"]
+        self.assertEqual({e["value"] for e in entries.values()}, set(values))
+        for value, result in zip(values, results):
+            self.assertNotIn(value, result.stdout)
+            ph = sg.PLACEHOLDER_RE.search(result.stdout).group()
+            self.assertEqual(entries[ph]["value"], value)
+
+    def test_entropy_cli_and_manual_purge(self):
+        value = "mQ7rT9xB2vN8kL5zW3cH6jP4sD1fG0aY"
+        result = self.run_process(args=["scan", "--entropy", "-"], text="prose " + value)
+        self.assertIn("high-entropy", result.stdout)
+        self.assertNotIn(value, result.stdout)
+        self.post(SID_A, "Bash", {"stdout": GLPAT})
+        self.run_process(args=["purge", "--all"])
+        self.assertFalse(os.path.exists(os.path.join(self.home, "vault", SID_A + ".json")))
+        self.assertTrue(os.path.exists(os.path.join(self.home, "vault", SID_A + ".json.lock")))
 
 
 if __name__ == "__main__":
