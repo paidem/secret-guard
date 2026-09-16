@@ -1,0 +1,13 @@
+{
+  "name": "paidem",
+  "owner": {
+    "name": "Pavel Paidem"
+  },
+  "plugins": [
+    {
+      "name": "secret-guard",
+      "source": "./",
+      "description": "Reversible secret redaction for Claude Code: tool results show [SECRET_…] placeholders, the real value is substituted back into tool calls within the same session, and the mapping expires."
+    }
+  ]
+}

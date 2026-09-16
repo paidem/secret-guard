@@ -1,0 +1,11 @@
+# Prohibited words / known secret values. Copy to ~/.claude/secret-guard/denylist.txt
+# (or <project>/.claude/secret-guard/denylist.txt) and edit. One entry per line.
+#   literal           exact, case-sensitive substring
+#   ci:literal        case-insensitive substring
+#   re:regex          regular expression (Python syntax); whole match is replaced
+# Lines starting with # and blank lines are ignored.
+#
+# Examples:
+# Sup3rS3cret!
+# ci:hunter2
+# re:\b[0-9a-f]{64}\b

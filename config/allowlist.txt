@@ -1,0 +1,9 @@
+# Values that must never be redacted even if a pattern matches. Same syntax as denylist.txt:
+#   literal           exact, case-sensitive
+#   ci:literal        exact, case-insensitive
+#   re:regex          full-match regular expression
+# The well-known documentation examples:
+AKIAIOSFODNN7EXAMPLE
+wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+re:(?i)(x{8,}|\*{8,}|#{8,}|\.{8,}|-{8,})
+re:(?i)(changeme|change_me|your[_-]?(?:password|token|secret|api[_-]?key)[_-]?here|placeholder|example|redacted|dummy|sample)[a-z0-9_-]*
