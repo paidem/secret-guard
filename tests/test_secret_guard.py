@@ -10,6 +10,8 @@ import sys
 import tempfile
 import time
 import unittest
+import re
+from unittest.mock import patch
 from contextlib import redirect_stdout
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -54,6 +56,18 @@ class Base(unittest.TestCase):
 
 
 class Detection(Base):
+    def test_long_non_secret_scan_and_regex_deadline(self):
+        with sg.scan_deadline(2):
+            self.assertFalse(self.find("A" * 100000))
+        with self.assertRaises(sg.ScanTimeout), sg.scan_deadline(0.02):
+            re.search(r"(a+)+$", "a" * 100 + "!")
+
+    def test_timeout_withholds_instead_of_crashing(self):
+        with patch.object(sg, "build_detectors", side_effect=sg.ScanTimeout()):
+            result = self.post(SID_A, "Read", {"type": "text", "file": {"content": GLPAT}})
+        self.assertEqual(result["hookSpecificOutput"]["updatedToolOutput"]["type"], "text")
+        self.assertNotIn(GLPAT, json.dumps(result))
+
     def find(self, text):
         return sg.find_secrets(text, sg.build_detectors(self.cfg), sg.build_allowlist())
 
