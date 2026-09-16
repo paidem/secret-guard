@@ -149,6 +149,24 @@ class Detection(Base):
 
 
 class RoundTrip(Base):
+    def test_secret_keys_roundtrip_and_collisions_deny(self):
+        result = self.post(SID_A, "mcp__x__get", {"result": {GLPAT: "metadata"}})
+        new = result["hookSpecificOutput"]["updatedToolOutput"]
+        ph = next(iter(new["result"]))
+        self.assertTrue(sg.PLACEHOLDER_RE.fullmatch(ph))
+        restored = self.pre(SID_A, "mcp__x__set", {"values": {ph: "metadata"}})
+        self.assertEqual(restored["hookSpecificOutput"]["updatedInput"]["values"], {GLPAT: "metadata"})
+        collision = self.pre(SID_A, "mcp__x__set", {"values": {ph: "a", GLPAT: "b"}})
+        self.assertEqual(collision["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_schema_keys_are_not_renamed(self):
+        with open(os.path.join(self.home, "denylist.txt"), "a") as f:
+            f.write("stdout\ntext\n")
+        result = self.post(SID_A, "Read", {"type": "text", "file": {"content": GLPAT}})
+        new = result["hookSpecificOutput"]["updatedToolOutput"]
+        self.assertEqual(new["type"], "text")
+        self.assertIn("withheld", new["file"]["content"])
+
     def test_known_secret_without_original_context(self):
         secret = "CorrectHorseBatteryStaple9!"
         first = self.post(SID_A, "Bash", {"stdout": "password=" + secret})
