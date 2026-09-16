@@ -290,11 +290,26 @@ class Vault(object):
         self.data = None
         self._lock = None
 
-    def __enter__(self):
+    def _acquire_lock(self, blocking=True):
         os.makedirs(self.dir, mode=0o700, exist_ok=True)
         os.chmod(self.dir, 0o700)
-        self._lock = os.fdopen(os.open(self.path + ".lock", os.O_WRONLY | os.O_CREAT, 0o600), "a")
-        fcntl.flock(self._lock, fcntl.LOCK_EX)
+        lock = os.fdopen(os.open(self.path + ".lock", os.O_WRONLY | os.O_CREAT, 0o600), "a")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except BaseException:
+            lock.close()
+            raise
+        return lock
+
+    def __enter__(self):
+        self._lock = self._acquire_lock()
+        try:
+            return self._load()
+        except BaseException:
+            self._lock.close()
+            raise
+
+    def _load(self):
         self.data = load_json(self.path, {
             "session_id": self.session_id, "created": now_iso(),
             "updated": now_iso(), "entries": {}})
@@ -374,12 +389,20 @@ class Vault(object):
             files.append(path)
             self._dirty = True
 
-    def delete(self):
-        for p in (self.path, self.path + ".lock"):
+    def delete(self, cutoff=None, blocking=True):
+        """Serialize deletion with writers; the stable lock inode must never be unlinked."""
+        try:
+            lock = self._acquire_lock(blocking)
+        except BlockingIOError:
+            return False
+        with lock:
             try:
-                os.unlink(p)
+                if cutoff is not None and os.stat(self.path).st_mtime >= cutoff:
+                    return False
+                os.unlink(self.path)
             except FileNotFoundError:
-                pass
+                return False
+            return True
 
 
 def sweep_vaults(ttl_hours):
@@ -393,16 +416,7 @@ def sweep_vaults(ttl_hours):
         p = os.path.join(d, name)
         if not name.endswith(".json") or name.startswith(".tmp-"):
             continue
-        try:
-            if os.stat(p).st_mtime < cutoff:
-                os.unlink(p)
-                try:
-                    os.unlink(p + ".lock")
-                except FileNotFoundError:
-                    pass
-                removed += 1
-        except FileNotFoundError:
-            pass
+        removed += int(Vault(name[:-5]).delete(cutoff=cutoff, blocking=False))
     return removed
 
 
@@ -861,18 +875,17 @@ def cli_purge(args):
     d = os.path.join(guard_home(), "vault")
     if not os.path.isdir(d):
         return 0
-    if args and args[0] == "--all":
-        n = 0
-        for name in os.listdir(d):
-            os.unlink(os.path.join(d, name))
-            n += 1
-        print("removed %d file(s)" % n)
-        return 0
     if args:
-        for name in os.listdir(d):
-            if name.startswith(args[0]):
-                os.unlink(os.path.join(d, name))
-                print("removed", name)
+        sessions = [name[:-5] for name in os.listdir(d)
+                    if name.endswith(".json") and not name.startswith(".tmp-")]
+        if args[0] != "--all":
+            sessions = [sid for sid in sessions if sid.startswith(args[0])]
+            if len(sessions) > 1:
+                print("ambiguous session prefix; use a full session id", file=sys.stderr)
+                return 2
+        for sid in sessions:
+            if Vault(sid).delete():
+                print("removed", sid + ".json")
         return 0
     print("removed %d expired vault(s)" % sweep_vaults(load_config()["ttl_hours"]))
     return 0

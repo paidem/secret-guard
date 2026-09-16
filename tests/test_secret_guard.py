@@ -11,6 +11,7 @@ import tempfile
 import time
 import unittest
 import re
+import threading
 from unittest.mock import patch
 from contextlib import redirect_stdout
 
@@ -268,6 +269,32 @@ class RoundTrip(Base):
 
 
 class Lifecycle(Base):
+    def test_cleanup_serializes_with_writer_and_keeps_lock_inode(self):
+        self.post(SID_A, "Bash", {"stdout": GLPAT})
+        path = self.vault_path(SID_A)
+        lock_inode = os.stat(path + ".lock").st_ino
+        started, finished = threading.Event(), threading.Event()
+        def purge():
+            started.set()
+            sg.Vault(SID_A).delete()
+            finished.set()
+        with sg.Vault(SID_A) as vault:
+            vault.touch()
+            self.assertEqual(sg.sweep_vaults(-1), 0)
+            worker = threading.Thread(target=purge)
+            worker.start()
+            self.assertTrue(started.wait(1))
+            self.assertFalse(finished.wait(0.03))
+        worker.join(2)
+        self.assertTrue(finished.is_set())
+        self.assertFalse(os.path.exists(path))
+        self.assertEqual(os.stat(path + ".lock").st_ino, lock_inode)
+
+    def test_sweeper_rechecks_expiry_under_lock(self):
+        self.post(SID_A, "Bash", {"stdout": GLPAT})
+        self.assertEqual(sg.sweep_vaults(24), 0)
+        self.assertTrue(os.path.exists(self.vault_path(SID_A)))
+
     def test_inspection_errors_block_prompt_tool_and_compaction(self):
         with patch.object(sg, "build_detectors", side_effect=OSError("sensitive diagnostic")):
             result = self.hook({"hook_event_name": "UserPromptSubmit", "session_id": SID_A, "prompt": GLPAT})
