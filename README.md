@@ -13,9 +13,10 @@ $ curl -H 'Authorization: Bearer [SECRET_20260916195748_b9e4]' …   # what actu
 curl -H 'Authorization: Bearer 7f3a…real…' …
 ```
 
-What is protected: every tool result (Bash, Read, Grep, MCP, subagent output…), the
-transcript on disk, and what is sent to the API. Verified with an egress-logging proxy — see
-"Known holes" for the one path that still leaks.
+The guard replaces detected secrets in successful tool results before they reach the
+model. It reduces exposure; it does not guarantee that transcripts, diagnostic logs,
+telemetry, or every API request are secret-free. See "Known holes" for paths that bypass
+redaction and the version-specific acceptance results below.
 
 ## Install
 
@@ -58,9 +59,31 @@ wins.
 Detection = built-in patterns (`config/patterns.json`: AWS, GitHub, GitLab, Slack, Stripe,
 Google, Anthropic/OpenAI, npm/PyPI/HF, Azure, JWT, PEM blocks, `Bearer`/`Basic`, URL
 credentials, `--password` flags, generic `password/token/secret/api_key = value`) plus your
-denylist. No entropy heuristics: on infra output they fire on every hash and UUID, and a false
-positive removes information from the model. Documentation examples (`AKIAIOSFODNN7EXAMPLE`,
+denylist and values already discovered in the current session. Overlapping detections
+redact their complete union. Object keys are scanned too; changes that would corrupt a
+tool's schema cause withholding instead. Documentation examples (`AKIAIOSFODNN7EXAMPLE`,
 `changeme`, `xxxxxxxx`) are allowlisted.
+
+Optional entropy detection finds opaque strings inside larger blocks of text even when
+they have no recognised vendor prefix or `password=` label. Enable it in `config.json`:
+
+```json
+{"entropy_detection": true}
+```
+
+The detector measures Shannon entropy **per candidate string**, rather than averaging the
+whole paragraph (which can hide a short secret among ordinary text). Defaults: at least
+24 characters and 4.2 bits per character, with at least two of lowercase, uppercase, and
+digits present. UUIDs, existing placeholders, and pure hexadecimal strings are excluded;
+the normal allowlist also applies. Set `entropy_include_hex: true` to inspect hexadecimal
+strings at `entropy_hex_threshold` (default 3.3), accepting false positives on hashes.
+
+Entropy cannot distinguish a random credential from a random public identifier or a base64
+asset, and low-entropy passwords can still be missed. It is off by default. Preview with
+`scan --entropy <file>` before enabling it across sessions. Findings use the same reversible
+vault mapping and prompt blocking as other detectors. The approach is also used by
+[Gitleaks](https://github.com/gitleaks/gitleaks) and
+[detect-secrets](https://github.com/Yelp/detect-secrets/blob/master/detect_secrets/plugins/high_entropy_strings.py).
 
 ## Files
 
@@ -71,6 +94,7 @@ positive removes information from the model. Documentation examples (`AKIAIOSFOD
   allowlist.txt      same syntax; never redact these
   patterns.json      extra detectors, same schema as config/patterns.json
   vault/<session>.json   0600; placeholder -> value, kind, uses, first seen
+  vault/<session>.json.lock   stable empty lock files, retained after cleanup
   secret-guard.log   events only, never values
 <project>/.claude/secret-guard/{denylist,allowlist}.txt   merged in when present
 ```
@@ -83,10 +107,28 @@ positive removes information from the model. Documentation examples (`AKIAIOSFOD
   "reinject_deny_tools": ["WebFetch", "WebSearch"],
   "prompt_policy": "block",              "compact_policy": "warn",
   "on_error": "withhold",                "max_scan_bytes": 8388608,
+  "scan_timeout_seconds": 2,
+  "entropy_detection": false,           "entropy_min_length": 24,
+  "entropy_threshold": 4.2,             "entropy_include_hex": false,
+  "entropy_hex_threshold": 3.3,
   "builtin_patterns": true,              "disabled_patterns": [],
   "log": true
 }
 ```
+
+Malformed configuration, detector rules, and vaults produce inspection failures rather
+than silently disabling rules. Inspection failures block prompts and tool execution;
+`compact_policy: block` also refuses compaction on errors. Post-tool failures follow
+`on_error`. Scanning uses an internal deadline (configurable up to 3 seconds), leaving time
+to report failure before Claude Code's hook timeout. Requires a POSIX system with `fcntl`
+and `SIGALRM` (Linux/macOS).
+
+Oversized or unscannable Bash, text Read, and MCP results receive safe replacement output.
+For unsupported response schemas, the guard stops the turn instead of emitting an invalid
+replacement that Claude Code would ignore. Stopping does not erase the original result:
+do not resume that conversation with sensitive output still present. Narrow the operation
+or add a supported response adapter. Ordinary prompt/tool activity refreshes vault expiry;
+cleanup holds the same lock as writers. Purge removes vault JSON, retaining empty lock files.
 
 ## CLI
 
@@ -96,6 +138,7 @@ $SG list                    # vaults: session, entries, age
 $SG list 76c3e539           # placeholders in one session (kinds, uses; never values)
 $SG show '[SECRET_20260916195748_b9e4]'     # the real value, for you
 $SG scan some-output.txt    # dry run: what would be redacted
+$SG scan --entropy some-output.txt  # preview entropy findings without changing config
 $SG purge                   # expired vaults; --all for everything; <session> for one
 $SG selftest
 ```
@@ -114,8 +157,8 @@ $SG selftest
    - `compact_policy: block` refuses compaction while the session vault is non-empty. Measured:
      nothing leaked, but when the context was genuinely full the turn failed with
      "Prompt is too long" and the session was over. Use it only for short sessions where a
-     leak would be worse than a lost session. Default `warn` records which files held secrets
-     (`secret-guard.log`, `pre-compact` line) and instructs the summarizer to keep
+     leak would be worse than a lost session. Default `warn` reports known secret-bearing
+     paths on stderr, logs their count, and instructs the summarizer to keep
      placeholders verbatim.
    - Files larger than ~20 KB are only restored as a path reference, never as content.
 2. **Failing Bash commands.** Non-zero exit goes through `PostToolUseFailure`, which cannot

@@ -25,6 +25,7 @@ import datetime as _dt
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import signal
@@ -32,6 +33,7 @@ import sys
 import tempfile
 import time
 from contextlib import contextmanager
+from collections import Counter
 
 VERSION = "0.1.0"
 
@@ -55,6 +57,11 @@ DEFAULTS = {
     "on_error": "withhold",            # withhold | passthrough
     "max_scan_bytes": 8 * 1024 * 1024,
     "scan_timeout_seconds": 2,
+    "entropy_detection": False,
+    "entropy_min_length": 24,
+    "entropy_threshold": 4.2,
+    "entropy_include_hex": False,
+    "entropy_hex_threshold": 3.3,
     "builtin_patterns": True,
     "disabled_patterns": [],
     "log": True,
@@ -95,7 +102,8 @@ def load_config():
                          "on_error": ("withhold", "passthrough")}.items():
         if cfg[key] not in choices:
             raise ValueError("invalid policy setting")
-    for key in ("ttl_hours", "max_scan_bytes", "scan_timeout_seconds"):
+    for key in ("ttl_hours", "max_scan_bytes", "scan_timeout_seconds", "entropy_min_length",
+                "entropy_threshold", "entropy_hex_threshold"):
         value = cfg[key]
         if type(value) not in (int, float) or not 0 < value < float("inf"):
             raise ValueError("invalid positive numeric setting")
@@ -104,7 +112,11 @@ def load_config():
     for key in ("delete_on", "reinject_deny_tools", "disabled_patterns"):
         if not isinstance(cfg[key], list) or not all(isinstance(s, str) for s in cfg[key]):
             raise ValueError("invalid list setting")
-    for key in ("builtin_patterns", "log"):
+    if type(cfg["entropy_min_length"]) is not int or cfg["entropy_min_length"] < 8:
+        raise ValueError("entropy_min_length must be an integer of at least 8")
+    if cfg["entropy_threshold"] > 6 or cfg["entropy_hex_threshold"] > 4:
+        raise ValueError("entropy threshold exceeds alphabet capacity")
+    for key in ("builtin_patterns", "log", "entropy_detection", "entropy_include_hex"):
         if type(cfg[key]) is not bool:
             raise ValueError("invalid boolean setting")
     return cfg
@@ -188,6 +200,43 @@ class Detector(object):
             yield start, end
 
 
+def shannon_entropy(value):
+    """Empirical bits per character, not an estimate of password strength."""
+    if not value:
+        return 0.0
+    n = len(value)
+    return -sum((count / n) * math.log2(count / n) for count in Counter(value).values())
+
+
+class EntropyDetector:
+    id = "high-entropy"
+    kind = "high-entropy"
+    candidates = re.compile(r"(?<![A-Za-z0-9_+/=-])[A-Za-z0-9_+/-]+={0,2}(?![A-Za-z0-9_+/=-])")
+    uuid = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+
+    def find(self, text):
+        for match in self.candidates.finditer(text):
+            value = match.group()
+            if len(value) < self.cfg["entropy_min_length"] or self.uuid.fullmatch(value):
+                continue
+            if re.fullmatch(r"[0-9a-fA-F]+", value):
+                if not self.cfg["entropy_include_hex"]:
+                    continue
+                threshold = self.cfg["entropy_hex_threshold"]
+            else:
+                # Ordinary words and numeric identifiers are poor entropy candidates.
+                classes = sum((bool(re.search(r"[a-z]", value)), bool(re.search(r"[A-Z]", value)),
+                               bool(re.search(r"[0-9]", value))))
+                if classes < 2:
+                    continue
+                threshold = self.cfg["entropy_threshold"]
+            if shannon_entropy(value) >= threshold:
+                yield match.span()
+
+
 def build_detectors(cfg, cwd=None):
     dets = []
     disabled = set(cfg.get("disabled_patterns") or [])
@@ -228,6 +277,8 @@ def build_detectors(cfg, cwd=None):
         for n, (kind, rx) in enumerate(read_list_file(path), 1):
             dets.append(Detector("denylist:%s:%d" % (os.path.basename(os.path.dirname(path)), n),
                                  "denylist", rx))
+    if cfg.get("entropy_detection") and "high-entropy" not in disabled:
+        dets.append(EntropyDetector(cfg))
     return dets
 
 
@@ -261,6 +312,8 @@ def find_secrets(text, detectors, allowlist, known_values=()):
             if PLACEHOLDER_RE.fullmatch(val) or allowed(val, allowlist):
                 continue
             hits.append((start, end, d.kind, d.id))
+    placeholders = [m.span() for m in PLACEHOLDER_RE.finditer(text)]
+    hits = [h for h in hits if not any(a <= h[0] and h[1] <= b for a, b in placeholders)]
     hits.sort(key=lambda h: (h[0], -h[1]))
     out = []
     for h in hits:
@@ -869,14 +922,17 @@ def cli_show(args):
 
 def cli_scan(args):
     cfg = load_config()
+    if "--entropy" in args:
+        cfg["entropy_detection"] = True
+        args = [a for a in args if a != "--entropy"]
     src = args[0] if args else "-"
     text = sys.stdin.read() if src == "-" else open(src, "r", encoding="utf-8", errors="replace").read()
-    hits = find_secrets(text, build_detectors(cfg, os.getcwd()), build_allowlist(os.getcwd()))
+    with scan_deadline(cfg["scan_timeout_seconds"]):
+        hits = find_secrets(text, build_detectors(cfg, os.getcwd()), build_allowlist(os.getcwd()))
     for start, end, kind, pid in hits:
         line = text.count("\n", 0, start) + 1
         v = text[start:end]
-        shown = v[:3] + "…" + v[-2:] if len(v) > 8 else "…"
-        print("line %d  %-18s %-24s %s (%d chars)" % (line, kind, pid, shown, len(v)))
+        print("line %d  %-18s %-24s (%d chars)" % (line, kind, pid, len(v)))
     print("%d hit(s)" % len(hits), file=sys.stderr)
     return 0
 

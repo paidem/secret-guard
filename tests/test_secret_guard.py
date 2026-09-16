@@ -57,6 +57,35 @@ class Base(unittest.TestCase):
 
 
 class Detection(Base):
+    def test_entropy_is_optional_and_respects_allowlists(self):
+        value = "mQ7rT9xB2vN8kL5zW3cH6jP4sD1fG0aY"
+        text = "ordinary text before\n" + value + "\nordinary text after"
+        self.assertFalse(self.find(text))
+        cfg = dict(self.cfg, entropy_detection=True)
+        dets = sg.build_detectors(cfg)
+        hits = sg.find_secrets(text, dets, [])
+        self.assertEqual([text[a:b] for a, b, _, _ in hits], [value])
+        self.assertFalse(sg.find_secrets(text, dets, [re.compile(re.escape(value))]))
+        for noise in ["4262480a-f593-47bf-b956-0591e722b714", "a" * 100,
+                      "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+                      "[SECRET_20260916194500_7f3a]", "ordinary words in a paragraph of prose"]:
+            self.assertFalse(sg.find_secrets(noise, dets, []), noise)
+        hex_value = "0123456789abcdef" * 3
+        self.assertTrue(sg.find_secrets(hex_value, sg.build_detectors(dict(cfg, entropy_include_hex=True)), []))
+        self.assertAlmostEqual(sg.shannon_entropy("abcd"), 2.0)
+
+    def test_entropy_roundtrip_and_prompt_blocking(self):
+        with open(os.path.join(self.home, "config.json"), "w") as f:
+            json.dump({"entropy_detection": True}, f)
+        value = "mQ7rT9xB2vN8kL5zW3cH6jP4sD1fG0aY"
+        result = self.post(SID_A, "Bash", {"stdout": "text " + value + " more text"})
+        ph = sg.PLACEHOLDER_RE.search(json.dumps(result)).group()
+        self.assertNotIn(value, json.dumps(result))
+        self.assertEqual(self.post(SID_A, "Bash", {"stdout": ph}), {})
+        self.assertEqual(self.pre(SID_A, "Write", {"content": ph})["hookSpecificOutput"]["updatedInput"]["content"], value)
+        self.assertEqual(self.hook({"hook_event_name": "UserPromptSubmit", "session_id": SID_B,
+                                   "prompt": value})["decision"], "block")
+
     def test_quoted_and_punctuation_passwords(self):
         for value in ["aB3defGhiJk;RemainingSecret", "@realPass123!", "$realPass123!",
                       "aB3 def,Ghi&Jk", "abc'defghi123", 'abc\\"defghi123']:
