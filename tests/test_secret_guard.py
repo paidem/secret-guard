@@ -250,6 +250,27 @@ class RoundTrip(Base):
 
 
 class Lifecycle(Base):
+    def test_inspection_errors_block_prompt_tool_and_compaction(self):
+        with patch.object(sg, "build_detectors", side_effect=OSError("sensitive diagnostic")):
+            result = self.hook({"hook_event_name": "UserPromptSubmit", "session_id": SID_A, "prompt": GLPAT})
+            self.assertEqual(result["decision"], "block")
+        with patch.object(sg, "load_config", side_effect=ValueError("bad config")):
+            self.assertEqual(self.pre(SID_A, "Bash", {"command": "ls"})["hookSpecificOutput"]["permissionDecision"], "deny")
+            with patch.object(sys, "stdin", io.StringIO(json.dumps({"hook_event_name": "PreCompact", "session_id": SID_A}))):
+                self.assertEqual(sg.run_hook(), 2)
+        with open(os.path.join(self.home, "secret-guard.log")) as f:
+            self.assertNotIn("sensitive diagnostic", f.read())
+
+    def test_malformed_rules_and_config_fail_closed(self):
+        for name, contents in [("patterns.json", "{"), ("patterns.json", '{"patterns":[{"id":"bad","kind":"test","regex":"("}]}'),
+                               ("config.json", '{"prompt_policy":"blok"}'), ("config.json", '{"max_scan_bytes":-1}')]:
+            path = os.path.join(self.home, name)
+            with open(path, "w") as f:
+                f.write(contents)
+            result = self.hook({"hook_event_name": "UserPromptSubmit", "session_id": SID_A, "prompt": GLPAT})
+            self.assertEqual(result["decision"], "block")
+            os.unlink(path)
+
     def vault_path(self, sid):
         return os.path.join(self.home, "vault", sid + ".json")
 
