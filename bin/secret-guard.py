@@ -425,7 +425,13 @@ def redact_text(text, vault, detectors, allowlist, tool):
     return "".join(parts), kinds
 
 
-def deep_map(obj, fn):
+SCHEMA_KEYS = frozenset(("stdout", "stderr", "interrupted", "isImage", "noOutputExpected",
+                         "type", "file", "content", "text", "filePath", "numLines", "startLine",
+                         "totalLines", "command", "file_path", "old_string", "new_string",
+                         "url", "query", "notebook_path"))
+
+
+def deep_map(obj, fn, protect_schema=False, map_keys=True):
     """Apply fn to every string in a JSON structure. -> (new_obj, changed)."""
     if isinstance(obj, str):
         new = fn(obj)
@@ -434,7 +440,7 @@ def deep_map(obj, fn):
         changed = False
         out = []
         for item in obj:
-            n, c = deep_map(item, fn)
+            n, c = deep_map(item, fn, protect_schema, map_keys)
             out.append(n)
             changed = changed or c
         return out, changed
@@ -442,9 +448,14 @@ def deep_map(obj, fn):
         changed = False
         out = {}
         for k, v in obj.items():
-            n, c = deep_map(v, fn)
-            out[k] = n
-            changed = changed or c
+            key = fn(k) if map_keys else k
+            n, c = deep_map(v, fn, protect_schema, map_keys)
+            if protect_schema and ((k in SCHEMA_KEYS and key != k) or (k == "type" and c)):
+                raise ValueError("redaction would alter the tool schema")
+            if key in out:
+                raise ValueError("replacement would collide with another object key")
+            out[key] = n
+            changed = changed or c or key != k
         return out, changed
     return obj, False
 
@@ -479,13 +490,16 @@ def withhold(obj, reason, tool):
     if tool.startswith("mcp__"):
         return [{"type": "text", "text": msg}]
     if tool == "Bash" and isinstance(obj, dict) and isinstance(obj.get("stdout"), str):
-        new, _ = deep_map(obj, lambda s: msg if s else s)
+        fields = {k: v for k, v in obj.items() if k in
+                  ("stdout", "stderr", "interrupted", "isImage", "noOutputExpected")}
+        new, _ = deep_map(fields, lambda s: msg if s else s, map_keys=False)
         return new
     if tool == "Read" and isinstance(obj, dict) and obj.get("type") == "text" \
             and isinstance(obj.get("file"), dict):
-        new, _ = deep_map(obj, lambda s: msg if s else s)
-        new["type"] = "text"
-        return new
+        fields = {k: v for k, v in obj["file"].items() if k in
+                  ("content", "filePath", "numLines", "startLine", "totalLines")}
+        new, _ = deep_map(fields, lambda s: msg if s else s, map_keys=False)
+        return {"type": "text", "file": new}
     return None
 
 
@@ -570,7 +584,7 @@ def on_post_tool_use(inp, cfg):
             new, kinds = redact_text(s, vault, detectors, allowlist, tool)
             kinds_all.extend(kinds)
             return new
-        new_resp, changed = deep_map(resp, fn)
+        new_resp, changed = deep_map(resp, fn, protect_schema=True)
         if changed:
             for path in files_touched(tool, inp.get("tool_input") or {}, inp.get("cwd")):
                 vault.note_file(path)
@@ -607,7 +621,7 @@ def on_pre_tool_use(inp, cfg):
                 resolved += 1
                 return v
             return PLACEHOLDER_RE.sub(sub, s)
-        new_ti, changed = deep_map(ti, fn)
+        new_ti, changed = deep_map(ti, fn, protect_schema=True)
     out = {}
     if unknown:
         note = ("secret-guard: placeholder(s) not known to this session, left as literal text: "
