@@ -299,12 +299,13 @@ def allowed(value, allowlist):
 def find_secrets(text, detectors, allowlist, known_values=()):
     """-> list of (start, end, kind, detector_id), non-overlapping, ascending."""
     hits = []
+    known_hits = []
     for value in known_values:
         if not value or allowed(value, allowlist):
             continue
         start = text.find(value)
         while start >= 0:
-            hits.append((start, start + len(value), "known-secret", "vault"))
+            known_hits.append((start, start + len(value), "known-secret", "vault"))
             start = text.find(value, start + 1)
     for d in detectors:
         for start, end in d.find(text):
@@ -312,6 +313,8 @@ def find_secrets(text, detectors, allowlist, known_values=()):
             if PLACEHOLDER_RE.fullmatch(val) or allowed(val, allowlist):
                 continue
             hits.append((start, end, d.kind, d.id))
+    # Prefer the specific detector's label when its span equals a known-value hit.
+    hits.extend(known_hits)
     placeholders = [m.span() for m in PLACEHOLDER_RE.finditer(text)]
     hits = [h for h in hits if not any(a <= h[0] and h[1] <= b for a, b in placeholders)]
     hits.sort(key=lambda h: (h[0], -h[1]))
