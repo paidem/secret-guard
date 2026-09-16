@@ -114,6 +114,22 @@ class Detection(Base):
 
 
 class RoundTrip(Base):
+    def test_known_secret_without_original_context(self):
+        secret = "CorrectHorseBatteryStaple9!"
+        first = self.post(SID_A, "Bash", {"stdout": "password=" + secret})
+        ph = sg.PLACEHOLDER_RE.search(json.dumps(first)).group()
+        self.assertIn(secret, json.dumps(self.pre(SID_A, "Bash", {"command": "echo " + ph})))
+        result = self.post(SID_A, "Bash", {"stdout": secret})
+        self.assertEqual(result["hookSpecificOutput"]["updatedToolOutput"]["stdout"], ph)
+        self.assertEqual(self.post(SID_B, "Bash", {"stdout": secret}), {})
+        prompt = self.hook({"hook_event_name": "UserPromptSubmit", "session_id": SID_A, "prompt": secret})
+        self.assertEqual(prompt["decision"], "block")
+
+    def test_discovery_is_independent_of_field_order(self):
+        secret = "CorrectHorseBatteryStaple9!"
+        result = self.post(SID_A, "Bash", {"stdout": secret, "stderr": "password=" + secret})
+        self.assertNotIn(secret, json.dumps(result))
+
     def test_withholding_preserves_read_and_mcp_schemas(self):
         for tool, resp in [("Read", {"type": "text", "file": {"content": GLPAT, "numLines": 1}}),
                            ("mcp__x__get", [{"type": "text", "text": GLPAT}])]:

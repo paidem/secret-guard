@@ -210,9 +210,16 @@ def allowed(value, allowlist):
     return False
 
 
-def find_secrets(text, detectors, allowlist):
+def find_secrets(text, detectors, allowlist, known_values=()):
     """-> list of (start, end, kind, detector_id), non-overlapping, ascending."""
     hits = []
+    for value in known_values:
+        if not value or allowed(value, allowlist):
+            continue
+        start = text.find(value)
+        while start >= 0:
+            hits.append((start, start + len(value), "known-secret", "vault"))
+            start = text.find(value, start + 1)
     for d in detectors:
         for start, end in d.find(text):
             val = text[start:end]
@@ -360,7 +367,8 @@ def sweep_vaults(ttl_hours):
 # ---------------------------------------------------------------------------- redaction
 
 def redact_text(text, vault, detectors, allowlist, tool):
-    hits = find_secrets(text, detectors, allowlist)
+    hits = find_secrets(text, detectors, allowlist,
+                        [e["value"] for e in vault.data["entries"].values()])
     if not hits:
         return text, []
     kinds = []
@@ -488,6 +496,13 @@ def on_post_tool_use(inp, cfg):
     allowlist = build_allowlist(inp.get("cwd"))
     kinds_all = []
     with Vault(sid) as vault:
+        # Discover values across the entire response before replacing any field: a
+        # bare value may precede the labelled field which identifies it as a secret.
+        def discover(s):
+            for start, end, kind, _ in find_secrets(s, detectors, allowlist):
+                vault.placeholder_for(s[start:end], kind, tool)
+            return s
+        deep_map(resp, discover)
         def fn(s):
             new, kinds = redact_text(s, vault, detectors, allowlist, tool)
             kinds_all.extend(kinds)
@@ -599,7 +614,9 @@ def on_post_tool_use_failure(inp, cfg):
     if not isinstance(err, str) or not err:
         return {}
     detectors = build_detectors(cfg, inp.get("cwd"))
-    hits = find_secrets(err, detectors, build_allowlist(inp.get("cwd")))
+    with Vault(sid) as vault:
+        hits = find_secrets(err, detectors, build_allowlist(inp.get("cwd")),
+                            [e["value"] for e in vault.data["entries"].values()])
     if not hits:
         return {}
     kinds = sorted(set(h[2] for h in hits))
@@ -615,7 +632,9 @@ def on_user_prompt_submit(inp, cfg):
         return {}
     prompt = inp.get("prompt") or ""
     detectors = build_detectors(cfg, inp.get("cwd"))
-    hits = find_secrets(prompt, detectors, build_allowlist(inp.get("cwd")))
+    with Vault(inp.get("session_id")) as vault:
+        hits = find_secrets(prompt, detectors, build_allowlist(inp.get("cwd")),
+                            [e["value"] for e in vault.data["entries"].values()])
     if not hits:
         return {}
     kinds = sorted(set(h[2] for h in hits))
