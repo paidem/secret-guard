@@ -29,6 +29,7 @@ import math
 import os
 import re
 import signal
+import stat
 import sys
 import tempfile
 import time
@@ -53,6 +54,7 @@ DEFAULTS = {
     "delete_on": ["clear", "logout"],
     "reinject_deny_tools": ["WebFetch", "WebSearch"],
     "prompt_policy": "block",          # block | off
+    "inspect_referenced_files": True,
     "compact_policy": "warn",          # warn | block | off   (see README: post-compact file restore)
     "on_error": "withhold",            # withhold | passthrough
     "max_scan_bytes": 8 * 1024 * 1024,
@@ -116,7 +118,8 @@ def load_config():
         raise ValueError("entropy_min_length must be an integer of at least 8")
     if cfg["entropy_threshold"] > 6 or cfg["entropy_hex_threshold"] > 4:
         raise ValueError("entropy threshold exceeds alphabet capacity")
-    for key in ("builtin_patterns", "log", "entropy_detection", "entropy_include_hex"):
+    for key in ("builtin_patterns", "log", "entropy_detection", "entropy_include_hex",
+                "inspect_referenced_files"):
         if type(cfg[key]) is not bool:
             raise ValueError("invalid boolean setting")
     return cfg
@@ -779,22 +782,127 @@ def on_post_tool_use_failure(inp, cfg):
                              % (inp.get("tool_name"), len(hits), ", ".join(kinds))}
 
 
+# Ignore email addresses; recognise @path, @"quoted path", and backslash-escaped spaces.
+FILE_REFERENCE_RE = re.compile(
+    r'''(?<![\w@/\\])@(?:"(?P<double>(?:\\.|[^"\\])*)"|'(?P<single>[^']*)'|'''
+    r'''(?P<bare>(?:\\[^\r\n]|[^\s`"'<>])+)|(?P<invalid>["']))''')
+REFERENCE_LINES_RE = re.compile(r"(?::\d+(?:-\d+)?|#L\d+(?:-L?\d+)?)$")
+
+
+class ReferenceInspectionError(Exception):
+    """Only fixed, non-sensitive explanations may be used as messages."""
+
+
+def referenced_paths(prompt, cwd):
+    """Resolve locally inspectable mentions without evaluating shell syntax.
+
+    Scan both literal and punctuation/range-stripped paths if both exist, since
+    interpreting an ambiguous mention differently from the host must not bypass a scan.
+    """
+    seen = set()
+    for match in FILE_REFERENCE_RE.finditer(prompt):
+        if match.group("invalid") is not None:
+            raise ReferenceInspectionError("a file reference has an unclosed quote")
+        raw = next(v for v in match.groupdict().values() if v is not None)
+        raw = re.sub(r"\\(.)", r"\1", raw)
+        variants = {raw}
+        if match.group("bare") is not None:
+            variants.add(raw.rstrip(".,;:!?)]}"))
+        variants.update(REFERENCE_LINES_RE.sub("", value) for value in tuple(variants))
+        found = False
+        for value in sorted(variants):
+            path = os.path.expanduser(value)
+            path = os.path.abspath(os.path.join(cwd or os.getcwd(), path))
+            try:
+                os.stat(path)
+            except FileNotFoundError:
+                continue
+            found = True
+            if path not in seen:
+                seen.add(path)
+                yield path
+        if not found:
+            raise ReferenceInspectionError("a reference could not be resolved to a local file")
+
+
+def inspect_references(prompt, cwd, cfg, detectors, allowlist, known_values):
+    remaining = int(cfg["max_scan_bytes"])
+    seen = set()
+    for path in referenced_paths(prompt, cwd):
+        # Claude Code can also attach CLAUDE.md files from the referenced file's
+        # directory and ancestors. Inspect those direct context files as well.
+        paths = [path]
+        for parent in {os.path.dirname(path), os.path.dirname(os.path.realpath(path))}:
+            while True:
+                context = os.path.join(parent, "CLAUDE.md")
+                try:
+                    os.stat(context)
+                except FileNotFoundError:
+                    pass
+                else:
+                    paths.append(context)
+                ancestor = os.path.dirname(parent)
+                if ancestor == parent:
+                    break
+                parent = ancestor
+        for candidate in paths:
+            candidate = os.path.realpath(candidate)
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            # O_NONBLOCK prevents a FIFO reference from hanging before fstat.
+            fd = os.open(candidate, os.O_RDONLY | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as source:
+                metadata = os.fstat(source.fileno())
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise ReferenceInspectionError("a reference is not a regular text file")
+                if metadata.st_size > remaining:
+                    raise ReferenceInspectionError("referenced files exceed max_scan_bytes")
+                content = source.read(remaining + 1)
+            remaining -= len(content)
+            if remaining < 0:
+                raise ReferenceInspectionError("referenced files exceed max_scan_bytes")
+            text = content.decode("utf-8-sig")
+            if "\x00" in text:
+                raise ReferenceInspectionError("a referenced file is binary, not inspectable text")
+            hits = find_secrets(text, detectors, allowlist, known_values)
+            if hits:
+                raise ReferenceInspectionError("a referenced file or accompanying CLAUDE.md contains detected secrets")
+
+
+def reference_block_reason(explanation):
+    return ("secret-guard: prompt blocked because %s. @file attachments bypass tool-result redaction. "
+            "Mention the path without @ and ask Claude to use Read instead, so detected secrets can be redacted. "
+            'To disable this check, set "inspect_referenced_files": false in %s/config.json '
+            "(referenced file contents may then be sent unredacted)." % (explanation, guard_home()))
+
+
 def on_user_prompt_submit(inp, cfg):
-    if cfg.get("prompt_policy", "block") == "off":
+    inspect_files = cfg.get("inspect_referenced_files", True)
+    scan_prompt = cfg.get("prompt_policy", "block") != "off"
+    if not scan_prompt and not inspect_files:
         return {}
     prompt = inp.get("prompt") or ""
     detectors = build_detectors(cfg, inp.get("cwd"))
+    allowlist = build_allowlist(inp.get("cwd"))
     with Vault(inp.get("session_id")) as vault:
-        hits = find_secrets(prompt, detectors, build_allowlist(inp.get("cwd")),
-                            [e["value"] for e in vault.data["entries"].values()])
+        known_values = [e["value"] for e in vault.data["entries"].values()]
+    hits = find_secrets(prompt, detectors, allowlist, known_values) if scan_prompt else []
     if not hits:
+        if inspect_files:
+            try:
+                inspect_references(prompt, inp.get("cwd"), cfg, detectors, allowlist, known_values)
+            except (ReferenceInspectionError, OSError, UnicodeError, ScanTimeout) as e:
+                explanation = str(e) if isinstance(e, ReferenceInspectionError) else "referenced files could not be fully inspected"
+                log_event(cfg, inp.get("session_id"), "reference-blocked", error=type(e).__name__)
+                return {"decision": "block", "reason": reference_block_reason(explanation)}
         return {}
     kinds = sorted(set(h[2] for h in hits))
     log_event(cfg, inp.get("session_id"), "prompt-blocked", count=len(hits), kinds=kinds)
     return {"decision": "block",
             "reason": "secret-guard: the prompt contains %d secret-like value(s) (%s). Claude Code cannot "
-                      "redact a prompt, so it was not sent. Put the value in a file and refer to the path "
-                      "(the file's contents will be redacted when read), or set prompt_policy to off in "
+                      "redact a prompt, so it was not sent. Put the value in a file, mention its path without @, "
+                      "and ask Claude to use Read (detected secrets will be redacted), or set prompt_policy to off in "
                       "%s/config.json." % (len(hits), ", ".join(kinds), guard_home())}
 
 
@@ -867,7 +975,10 @@ def run_hook():
         if ev == "PreCompact":
             return 2 if cfg.get("compact_policy") == "block" else 0
         if ev == "UserPromptSubmit":
-            emit({"decision": "block", "reason": "secret-guard: inspection failed"})
+            reason = "secret-guard: inspection failed"
+            if cfg.get("inspect_referenced_files", True) and FILE_REFERENCE_RE.search(inp.get("prompt") or ""):
+                reason = reference_block_reason("referenced files could not be fully inspected")
+            emit({"decision": "block", "reason": reason})
             return 0
         if ev == "PreToolUse":
             emit({"hookSpecificOutput": {"hookEventName": ev, "permissionDecision": "deny",

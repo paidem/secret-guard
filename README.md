@@ -50,7 +50,7 @@ wins.
 |---|---|
 | `PostToolUse` (all tools) | every string in `tool_response` is scanned; hits become `[SECRET_<yyyymmddHHMMSS>_<hex>]`; the whole response is returned as `updatedToolOutput`. The same value always gets the same placeholder within a session. |
 | `PreToolUse` (all tools) | placeholders in `tool_input` are replaced by the real value from **this session's** vault (`updatedInput`). Unknown placeholders stay literal and you get a notice. `WebFetch`/`WebSearch` calls carrying a placeholder are denied. |
-| `UserPromptSubmit` | a prompt that itself contains a secret is blocked (Claude Code cannot rewrite a prompt). Put the value in a file and refer to the path. `prompt_policy: off` disables. |
+| `UserPromptSubmit` | blocks detected secrets in pasted text and inspects local `@file` references before submission. Mention a plain path and ask for Read to get redaction. `prompt_policy: off` disables pasted-text checking; `inspect_referenced_files: false` separately disables reference inspection. |
 | `PostToolUseFailure` | output of a failing Bash command **cannot** be rewritten; the hook warns you when it contained a secret. |
 | `PreCompact` | warns (or refuses, see below) and tells the summarizer to keep placeholders verbatim. |
 | `SessionStart` | tells the model how placeholders work; sweeps expired vaults. |
@@ -85,6 +85,36 @@ vault mapping and prompt blocking as other detectors. The approach is also used 
 [Gitleaks](https://github.com/gitleaks/gitleaks) and
 [detect-secrets](https://github.com/Yelp/detect-secrets/blob/master/detect_secrets/plugins/high_entropy_strings.py).
 
+### Referenced files in prompts
+
+`inspect_referenced_files` defaults to `true`. Before accepting `Review @secrets.env`,
+the guard reads the file locally and applies the same detectors, denylist, allowlist,
+known session values, and optional entropy detection. If it finds a secret, it blocks
+the entire prompt without echoing the secret or changing the file. Clean files pass.
+Every reference-related block explains the alternative and how to disable this check:
+
+```json
+{"inspect_referenced_files": false}
+```
+
+Set this in `~/.claude/secret-guard/config.json` (or `$SECRET_GUARD_HOME/config.json`).
+Disabling it allows referenced contents to bypass this inspection. Pasted-text checking
+is a separate setting. To use a secret-bearing file through redaction, write
+`Use Read to inspect secrets.env` without the `@`.
+
+The check handles relative paths from the hook's `cwd`, absolute and `~/` paths, quoted
+paths with spaces (`@"secret file.env"`), escaped spaces, symlinks, and common line suffixes
+such as `:10-20` or `#L10-L20`. It scans the whole file even when a range is specified.
+It also checks accompanying `CLAUDE.md` files in the referenced file's directory and
+ancestors, which [Claude Code can add with file references](https://code.claude.com/docs/en/common-workflows#reference-files-and-directories).
+
+The total file bytes must fit `max_scan_bytes`, and all checks share the hook's scan
+deadline. Missing/unreadable files, non-UTF-8 or NUL-containing content, special files,
+directories, and nonlocal references such as `@server:resource` are blocked because
+they cannot be fully inspected as local text. Email addresses are not file references.
+The guard does not fetch remote resources, expand shell variables, or recurse through
+directory contents or imports inside `CLAUDE.md`.
+
 ## Files
 
 ```
@@ -106,6 +136,7 @@ vault mapping and prompt blocking as other detectors. The approach is also used 
   "ttl_hours": 24,                       "delete_on": ["clear", "logout"],
   "reinject_deny_tools": ["WebFetch", "WebSearch"],
   "prompt_policy": "block",              "compact_policy": "warn",
+  "inspect_referenced_files": true,
   "on_error": "withhold",                "max_scan_bytes": 8388608,
   "scan_timeout_seconds": 2,
   "entropy_detection": false,           "entropy_min_length": 24,
@@ -163,7 +194,11 @@ $SG selftest
    - Files larger than ~20 KB are only restored as a path reference, never as content.
 2. **Failing Bash commands.** Non-zero exit goes through `PostToolUseFailure`, which cannot
    be rewritten. `cmd || true` style wrappers avoid it; a transparent wrapper is a follow-up.
-3. **`@file` mentions** inline the file outside the hook pipeline. Use Read or `cat`.
+3. **Attachments and `@file` mentions.** Local textual references are inspected by default
+   before submission, but their contents are still attached outside tool-result redaction.
+   A file can change between inspection and attachment; detector misses, indirect context
+   imports, and UI attachments not represented as textual `@file` references are not covered.
+   Prefer a plain path and Read when you need reversible redaction.
 4. **Local transcript.** The hook's own stdout is recorded in the transcript as a
    `hook_success` attachment, so a re-injected value does sit in
    `~/.claude/projects/…/<session>.jsonl` (mode 0600). It is not part of the messages sent
