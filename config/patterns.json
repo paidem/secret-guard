@@ -68,7 +68,7 @@
     {"id": "cli-password-flag", "kind": "cli-password",
      "regex": "(?:^|\\s)--?(?:password|passwd|token|api[-_]?key|secret|client[-_]?secret|access[-_]?key|secret[-_]?key)(?:=|\\s+)(?P<v>[^\\s\"'`]{4,})", "group": "v", "flags": "im"},
     {"id": "generic-assignment", "kind": "credential",
-     "regex": "(?P<k>[A-Za-z0-9_.-]*(?:password|passwd|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|auth[_-]?key|credential|client[_-]?secret)[A-Za-z0-9_.-]*)[\"']?\\s*(?:=>|[:=])\\s*[\"']?(?P<v>[^\\s\"',;&)\\]}>]{8,})",
+     "regex": "(?<![A-Za-z0-9_.-])(?P<k>[A-Za-z0-9_.-]*(?:password|passwd|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|auth[_-]?key|credential|client[_-]?secret)[A-Za-z0-9_.-]*)[\"']?\\s*(?:=>|[:=])\\s*[\"']?(?P<v>[^\\s\"',;&)\\]}>]{8,})",
      "group": "v", "flags": "i", "generic": true}
   ]
 }

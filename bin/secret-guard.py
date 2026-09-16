@@ -27,9 +27,11 @@ import hashlib
 import json
 import os
 import re
+import signal
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 
 VERSION = "0.1.0"
 
@@ -52,6 +54,7 @@ DEFAULTS = {
     "compact_policy": "warn",          # warn | block | off   (see README: post-compact file restore)
     "on_error": "withhold",            # withhold | passthrough
     "max_scan_bytes": 8 * 1024 * 1024,
+    "scan_timeout_seconds": 2,
     "builtin_patterns": True,
     "disabled_patterns": [],
     "log": True,
@@ -476,6 +479,27 @@ def log_event(cfg, session_id, event, **fields):
 
 # ------------------------------------------------------------------------- hook handlers
 
+class ScanTimeout(Exception):
+    pass
+
+
+@contextmanager
+def scan_deadline(seconds):
+    """Interrupt even a single pathological stdlib regex before the host timeout."""
+    seconds = float(seconds)
+    if not 0 < seconds <= 3:
+        raise ValueError("scan_timeout_seconds must be greater than 0 and at most 3")
+    def expired(signum, frame):
+        raise ScanTimeout("scan deadline exceeded")
+    previous = signal.signal(signal.SIGALRM, expired)
+    timer = signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+        signal.setitimer(signal.ITIMER_REAL, *timer)
+
 def emit(obj):
     sys.stdout.write(json.dumps(obj))
     sys.stdout.write("\n")
@@ -701,7 +725,8 @@ def run_hook():
         emit({})
         return 0
     try:
-        result = handler(inp, cfg)
+        with scan_deadline(cfg["scan_timeout_seconds"]):
+            result = handler(inp, cfg)
         if ev == "PreCompact":
             return result or 0
         emit(result)
@@ -709,6 +734,13 @@ def run_hook():
         log_event(cfg, inp.get("session_id"), "error", hook=ev, error=repr(e))
         sys.stderr.write("secret-guard: %s handler failed: %r\n" % (ev, e))
         if ev == "PreCompact":
+            return 2 if isinstance(e, ScanTimeout) else 0
+        if isinstance(e, ScanTimeout) and ev == "UserPromptSubmit":
+            emit({"decision": "block", "reason": "secret-guard: inspection timed out"})
+            return 0
+        if isinstance(e, ScanTimeout) and ev == "PreToolUse":
+            emit({"hookSpecificOutput": {"hookEventName": ev, "permissionDecision": "deny",
+                                         "permissionDecisionReason": "secret-guard: inspection timed out"}})
             return 0
         if ev == "PostToolUse" and cfg.get("on_error", "withhold") == "withhold" \
                 and inp.get("tool_response") is not None:
