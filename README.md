@@ -60,11 +60,25 @@ wins.
 
 Detection = built-in patterns (`config/patterns.json`: AWS, GitHub, GitLab, Slack, Stripe,
 Google, Anthropic/OpenAI, npm/PyPI/HF, Azure, JWT, PEM blocks, `Bearer`/`Basic`, URL
-credentials, `--password` flags, generic `password/token/secret/api_key = value`) plus your
-denylist and values already discovered in the current session. Overlapping detections
-redact their complete union. Object keys are scanned too; changes that would corrupt a
-tool's schema cause withholding instead. Documentation examples (`AKIAIOSFODNN7EXAMPLE`,
-`changeme`, `xxxxxxxx`) are allowlisted.
+credentials) plus your denylist and values already discovered in the current session.
+Overlapping detections redact their complete union. Object keys are scanned too; changes
+that would corrupt a tool's schema cause withholding instead. Documentation examples
+(`AKIAIOSFODNN7EXAMPLE`, `changeme`, `xxxxxxxx`) are allowlisted.
+
+Keyword-labelled values — `password/token/secret/api_key = value`, `key: value`, and
+`--password value` flags — are **off by default**, because the label alone is a weak
+signal: `password_file=/etc/app/pw`, `not-a-secret-location: /srv/x` or
+`token_ttl: 3600` are not secrets, and every such false positive turns a harmless path
+into an opaque placeholder. Turn them on in `config.json` when the sessions you run
+really do print raw passwords next to their labels:
+
+```json
+{"generic_detection": true}
+```
+
+`scan --generic <file>` previews what that would catch. Rules in your own `patterns.json`
+marked `"generic": true` follow the same switch. Vendor-prefixed tokens, `Bearer` headers,
+URL credentials, PEM blocks, the denylist and already-known values are detected regardless.
 
 Optional entropy detection finds opaque strings inside larger blocks of text even when
 they have no recognised vendor prefix or `password=` label. Enable it in `config.json`:
@@ -141,6 +155,7 @@ directory contents or imports inside `CLAUDE.md`.
   "inspect_referenced_files": true,
   "on_error": "withhold",                "max_scan_bytes": 8388608,
   "scan_timeout_seconds": 2,
+  "generic_detection": false,
   "entropy_detection": false,           "entropy_min_length": 24,
   "entropy_threshold": 4.2,             "entropy_include_hex": false,
   "entropy_hex_threshold": 3.3,
@@ -172,6 +187,7 @@ $SG list 76c3e539           # placeholders in one session (kinds, uses; never va
 $SG show '[SECRET_20260916195748_b9e4]'     # the real value, for you
 $SG scan some-output.txt    # dry run: what would be redacted
 $SG scan --entropy some-output.txt  # preview entropy findings without changing config
+$SG scan --generic some-output.txt  # preview password=/token: style findings likewise
 $SG purge                   # expired vaults; --all for everything; <session> for one
 $SG selftest
 ```

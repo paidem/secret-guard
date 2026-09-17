@@ -16,7 +16,7 @@ State: ~/.claude/secret-guard/ (override with SECRET_GUARD_HOME)
   vault/<session_id>.json (0600), secret-guard.log (events only, never values).
 
 CLI:  secret-guard.py hook | list [session] | show <placeholder> [--session id]
-      | scan <file|-> | purge [--all | session] | selftest
+      | scan [--generic] [--entropy] <file|-> | purge [--all | session] | selftest
 
 Python 3.9+, standard library only. See docs/superpowers/specs/ for the design.
 """
@@ -59,6 +59,7 @@ DEFAULTS = {
     "on_error": "withhold",            # withhold | passthrough
     "max_scan_bytes": 8 * 1024 * 1024,
     "scan_timeout_seconds": 2,
+    "generic_detection": False,        # keyword-labelled values: password=..., --token ...
     "entropy_detection": False,
     "entropy_min_length": 24,
     "entropy_threshold": 4.2,
@@ -118,8 +119,8 @@ def load_config():
         raise ValueError("entropy_min_length must be an integer of at least 8")
     if cfg["entropy_threshold"] > 6 or cfg["entropy_hex_threshold"] > 4:
         raise ValueError("entropy threshold exceeds alphabet capacity")
-    for key in ("builtin_patterns", "log", "entropy_detection", "entropy_include_hex",
-                "inspect_referenced_files"):
+    for key in ("builtin_patterns", "log", "generic_detection", "entropy_detection",
+                "entropy_include_hex", "inspect_referenced_files"):
         if type(cfg[key]) is not bool:
             raise ValueError("invalid boolean setting")
     return cfg
@@ -241,8 +242,12 @@ class EntropyDetector:
 
 
 def build_detectors(cfg, cwd=None):
+    """Detectors flagged `generic` (keyword-labelled values such as `password=...` or
+    `--token ...`) only load when `generic_detection` is on; by default detection relies
+    on vendor prefixes, structure (Bearer, URL credentials, PEM) and the denylist."""
     dets = []
     disabled = set(cfg.get("disabled_patterns") or [])
+    generic_on = bool(cfg.get("generic_detection"))
 
     def add_pattern_file(path, required=False):
         data = load_json(path, None)
@@ -253,7 +258,7 @@ def build_detectors(cfg, cwd=None):
         for p in (data.get("patterns") or []):
             if not isinstance(p, dict) or not all(isinstance(p.get(k), str) for k in ("id", "kind", "regex")):
                 raise ValueError("invalid detector definition")
-            if p.get("id") in disabled:
+            if p.get("id") in disabled or (p.get("generic") and not generic_on):
                 continue
             flags = 0
             for ch in (p.get("flags") or ""):
@@ -1036,9 +1041,10 @@ def cli_show(args):
 
 def cli_scan(args):
     cfg = load_config()
-    if "--entropy" in args:
-        cfg["entropy_detection"] = True
-        args = [a for a in args if a != "--entropy"]
+    for flag, key in (("--entropy", "entropy_detection"), ("--generic", "generic_detection")):
+        if flag in args:
+            cfg[key] = True
+            args = [a for a in args if a != flag]
     src = args[0] if args else "-"
     text = sys.stdin.read() if src == "-" else open(src, "r", encoding="utf-8", errors="replace").read()
     with scan_deadline(cfg["scan_timeout_seconds"]):
@@ -1078,7 +1084,7 @@ def cli_selftest():
     samples = [
         ("glpat-abcdefghijklmnopqrst", True),
         ("AKIAIOSFODNN7EXAMPLE", False),
-        ("password=hunter2hunter2", True),
+        ("password=hunter2hunter2", cfg["generic_detection"]),
         ("password=${DB_PASSWORD}", False),
         ("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcdefghijklmnop", True),
         ("ssh -p 2222 root@host", False),

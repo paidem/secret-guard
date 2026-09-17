@@ -42,6 +42,12 @@ class Base(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.home, ignore_errors=True)
 
+    def enable_generic(self):
+        """Turn keyword-labelled detection on for hooks run through config.json."""
+        with open(os.path.join(self.home, "config.json"), "w") as f:
+            json.dump({"generic_detection": True}, f)
+        self.cfg = sg.load_config()
+
     def hook(self, payload):
         buf = io.StringIO()
         with patch.object(sys, "stdin", io.StringIO(json.dumps(payload))), redirect_stdout(buf):
@@ -88,6 +94,7 @@ class Detection(Base):
                                    "prompt": value})["decision"], "block")
 
     def test_quoted_and_punctuation_passwords(self):
+        self.cfg["generic_detection"] = True
         for value in ["aB3defGhiJk;RemainingSecret", "@realPass123!", "$realPass123!",
                       "aB3 def,Ghi&Jk", "abc'defghi123", 'abc\\"defghi123']:
             for prefix in ['password="', '--password "', '--password="']:
@@ -119,10 +126,35 @@ class Detection(Base):
                   "AIzaSyA1234567890abcdefghijklmnopqrstuv"]:
             self.assertTrue(self.find("x " + t + " y"), t)
 
+    def test_generic_detection_is_off_by_default(self):
+        # Keyword-labelled values are not secrets by default: only vendor-prefixed and
+        # structural detectors (Bearer, URL credentials, PEM ...) run.
+        for text in ["password_file=/etc/app/secret.txt", "not-a-secret-location: /srv/data",
+                     "DB_PASSWORD=s3cretvalue", 'token: "qwertyuiop1234"',
+                     "mysql --password=hunter2hunter2 db"]:
+            self.assertFalse(self.find(text), text)
+        self.assertTrue(self.find("password_file=" + GLPAT))
+        self.assertNotIn("cli-password-flag", [d.id for d in sg.build_detectors(self.cfg)])
+        self.assertNotIn("generic-assignment", [d.id for d in sg.build_detectors(self.cfg)])
+
+    def test_generic_detection_gates_user_patterns_too(self):
+        with open(os.path.join(self.home, "patterns.json"), "w") as f:
+            json.dump({"patterns": [
+                {"id": "my-generic", "kind": "credential", "regex": "pin=(?P<v>\\d{6})",
+                 "group": "v", "generic": True},
+                {"id": "my-specific", "kind": "acme-token", "regex": "\\b(acme_[a-z0-9]{12})\\b"}]}, f)
+        ids = [d.id for d in sg.build_detectors(self.cfg)]
+        self.assertIn("my-specific", ids)
+        self.assertNotIn("my-generic", ids)
+        ids = [d.id for d in sg.build_detectors(dict(self.cfg, generic_detection=True))]
+        self.assertIn("my-generic", ids)
+
     def test_generic_assignment_and_noise(self):
+        self.cfg["generic_detection"] = True
         self.assertTrue(self.find("DB_PASSWORD=s3cretvalue"))
         self.assertTrue(self.find('"api_key": "abcdefgh12345678"'))
         self.assertTrue(self.find("token: qwertyuiop1234"))
+        self.assertTrue(self.find("mysql --password=hunter2hunter2 db"))
         self.assertFalse(self.find("password=${DB_PASSWORD}"))
         self.assertFalse(self.find("password: <your-password>"))
         self.assertFalse(self.find("token: null"))
@@ -199,6 +231,7 @@ class RoundTrip(Base):
         self.assertIn("withheld", new["file"]["content"])
 
     def test_known_secret_without_original_context(self):
+        self.enable_generic()
         secret = "CorrectHorseBatteryStaple9!"
         first = self.post(SID_A, "Bash", {"stdout": "password=" + secret})
         ph = sg.PLACEHOLDER_RE.search(json.dumps(first)).group()
@@ -210,8 +243,11 @@ class RoundTrip(Base):
         self.assertEqual(prompt["decision"], "block")
 
     def test_discovery_is_independent_of_field_order(self):
+        self.enable_generic()
         secret = "CorrectHorseBatteryStaple9!"
         result = self.post(SID_A, "Bash", {"stdout": secret, "stderr": "password=" + secret})
+        self.assertEqual(result["hookSpecificOutput"]["updatedToolOutput"]["stdout"],
+                         result["hookSpecificOutput"]["updatedToolOutput"]["stderr"][len("password="):])
         self.assertNotIn(secret, json.dumps(result))
 
     def test_withholding_preserves_read_and_mcp_schemas(self):
@@ -550,7 +586,9 @@ class ReferencedFiles(Base):
         self.assert_reference_blocked(self.prompt("Review @data.txt"))
         self.write_file("allowlist.txt", "Sup3rS3cret!\n")
         self.assertEqual(self.prompt("Review @data.txt"), {})
+        self.configure(generic_detection=True)
         self.post(SID_A, "Bash", {"stdout": "password=CorrectHorseBatteryStaple9!"})
+        self.configure()
         self.write_file("data.txt", "CorrectHorseBatteryStaple9!")
         self.assert_reference_blocked(self.prompt("Review @data.txt"))
         self.write_file("data.txt", "mQ7rT9xB2vN8kL5zW3cH6jP4sD1fG0aY")
@@ -642,6 +680,13 @@ class ProcessIntegration(Base):
         result = self.run_process(args=["scan", "--entropy", "-"], text="prose " + value)
         self.assertIn("high-entropy", result.stdout)
         self.assertNotIn(value, result.stdout)
+        result = self.run_process(args=["scan", "-"], text="password=hunter2hunter2")
+        self.assertEqual(result.stdout, "")
+        result = self.run_process(args=["scan", "--generic", "-"], text="password=hunter2hunter2")
+        self.assertIn("generic-assignment", result.stdout)
+        self.assertNotIn("hunter2", result.stdout)
+        result = self.run_process(args=["selftest"])
+        self.assertNotIn("FAIL", result.stdout)
         self.post(SID_A, "Bash", {"stdout": GLPAT})
         self.run_process(args=["purge", "--all"])
         self.assertFalse(os.path.exists(os.path.join(self.home, "vault", SID_A + ".json")))
