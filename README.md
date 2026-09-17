@@ -65,20 +65,52 @@ Overlapping detections redact their complete union. Object keys are scanned too;
 that would corrupt a tool's schema cause withholding instead. Documentation examples
 (`AKIAIOSFODNN7EXAMPLE`, `changeme`, `xxxxxxxx`) are allowlisted.
 
-Keyword-labelled values — `password/token/secret/api_key = value`, `key: value`, and
-`--password value` flags — are **off by default**, because the label alone is a weak
-signal: `password_file=/etc/app/pw`, `not-a-secret-location: /srv/x` or
-`token_ttl: 3600` are not secrets, and every such false positive turns a harmless path
-into an opaque placeholder. Turn them on in `config.json` when the sessions you run
-really do print raw passwords next to their labels:
+Keyword-labelled values (`password/token/secret/api_key = value`, `key: value`,
+`--password value`) come in two tiers, because the label alone is a weak signal:
+
+- **`keyword_detection`** (on by default) — the key must *end* with the keyword, i.e. it
+  names the secret itself: `JIRA_PASSWORD=…`, `API_TOKEN=…`, `"client_secret": "…"`,
+  `--password …`. Keys that merely mention it — `PASSWORD_LIFETIME`, `TOKEN_TTL`,
+  `password_file`, `secret_location`, `max_tokens` — are left alone.
+- **`generic_detection`** (off by default) — the keyword may sit anywhere in the key. This
+  also catches `API_TOKEN_PROD=…` or `PASSWORD_OLD=…`, at the price of turning
+  `token_ttl: 86400000` into an opaque placeholder. Turn it on when your sessions really
+  do print raw passwords under such keys:
 
 ```json
 {"generic_detection": true}
 ```
 
-`scan --generic <file>` previews what that would catch. Rules in your own `patterns.json`
-marked `"generic": true` follow the same switch. Vendor-prefixed tokens, `Bearer` headers,
-URL credentials, PEM blocks, the denylist and already-known values are detected regardless.
+In both tiers the value has to look like a literal: at least 8 characters (4 for CLI
+flags), not a path or URL, not an unquoted code expression (`get_token(…)`, `args.token`,
+`os.environ["X"]`), not a `${VAR}`/`<placeholder>`, and not allowlisted.
+
+| example | default | `generic_detection: true` | `keyword_detection: false` |
+|---|:---:|:---:|:---:|
+| `JIRA_PASSWORD=s3cretvalue` | redacted | redacted | – |
+| `API_TOKEN=elkjgroeij434frer` | redacted | redacted | – |
+| `"client_secret": "abcdefgh12345678"` | redacted | redacted | – |
+| `db.password: qwertyuiop1234` | redacted | redacted | – |
+| `mysql --password=hunter2hunter2 db` | redacted | redacted | – |
+| `API_TOKEN_PROD=elkjgroeij434frer` | – | redacted | – |
+| `PASSWORD_OLD=s3cretvalue` | – | redacted | – |
+| `PASSWORD_LIFETIME=3600seconds` | – | redacted | – |
+| `TOKEN_TTL=86400000` | – | redacted | – |
+| `secret_location=eu-central-1a` | – | redacted | – |
+| `password_file=/etc/app/pw` (path) | – | – | – |
+| `token: /var/run/secrets/token` (path) | – | – | – |
+| `token = get_token(session)` (code) | – | – | – |
+| `password = args.password` (code) | – | – | – |
+| `password=${DB_PASSWORD}` (variable) | – | – | – |
+| `PASSWORD=changeme` (allowlisted) | – | – | – |
+| `password=abc123` (shorter than 8) | – | – | – |
+| `GITLAB_TOKEN_OLD=glpat-Zx9Qw8Er7Ty6…` (vendor prefix) | redacted | redacted | redacted |
+
+The two settings are independent; with both on, overlapping hits merge. `scan --generic
+<file>` previews what the loose tier would add. Rules in your own `patterns.json` join a
+tier with `"generic": "strict"` or `"generic": true`. Vendor-prefixed tokens, `Bearer`
+headers, URL credentials, PEM blocks, the denylist and already-known values are detected
+regardless of both settings.
 
 Optional entropy detection finds opaque strings inside larger blocks of text even when
 they have no recognised vendor prefix or `password=` label. Enable it in `config.json`:
@@ -155,7 +187,7 @@ directory contents or imports inside `CLAUDE.md`.
   "inspect_referenced_files": true,
   "on_error": "withhold",                "max_scan_bytes": 8388608,
   "scan_timeout_seconds": 2,
-  "generic_detection": false,
+  "keyword_detection": true,            "generic_detection": false,
   "entropy_detection": false,           "entropy_min_length": 24,
   "entropy_threshold": 4.2,             "entropy_include_hex": false,
   "entropy_hex_threshold": 3.3,
@@ -187,7 +219,7 @@ $SG list 76c3e539           # placeholders in one session (kinds, uses; never va
 $SG show '[SECRET_20260916195748_b9e4]'     # the real value, for you
 $SG scan some-output.txt    # dry run: what would be redacted
 $SG scan --entropy some-output.txt  # preview entropy findings without changing config
-$SG scan --generic some-output.txt  # preview password=/token: style findings likewise
+$SG scan --generic some-output.txt  # preview what generic_detection would add
 $SG purge                   # expired vaults; --all for everything; <session> for one
 $SG selftest
 ```

@@ -127,15 +127,64 @@ class Detection(Base):
             self.assertTrue(self.find("x " + t + " y"), t)
 
     def test_generic_detection_is_off_by_default(self):
-        # Keyword-labelled values are not secrets by default: only vendor-prefixed and
-        # structural detectors (Bearer, URL credentials, PEM ...) run.
+        # A keyword somewhere inside the key is a weak signal, so the loose rule is off.
         for text in ["password_file=/etc/app/secret.txt", "not-a-secret-location: /srv/data",
-                     "DB_PASSWORD=s3cretvalue", 'token: "qwertyuiop1234"',
-                     "mysql --password=hunter2hunter2 db"]:
+                     "PASSWORD_LIFETIME=3600xxxx", "TOKEN_TTL=86400000", "token_lifetime: abcdefgh1234",
+                     "secret_location=abcdefgh1234", "max_tokens: 1234567890"]:
             self.assertFalse(self.find(text), text)
         self.assertTrue(self.find("password_file=" + GLPAT))
-        self.assertNotIn("cli-password-flag", [d.id for d in sg.build_detectors(self.cfg)])
         self.assertNotIn("generic-assignment", [d.id for d in sg.build_detectors(self.cfg)])
+
+    def test_keyword_detection_is_on_by_default(self):
+        # A key that *ends* with the keyword names the secret itself.
+        for text, value in [("JIRA_PASSWORD=s3cretvalue", "s3cretvalue"),
+                            ("API_TOKEN=elkjgroeij434frer", "elkjgroeij434frer"),
+                            ('"client_secret": "abcdefgh12345678"', "abcdefgh12345678"),
+                            ("db.password: qwertyuiop1234", "qwertyuiop1234"),
+                            ("password => 'hunter2hunter2'", "hunter2hunter2"),
+                            ("export SECRET_KEY=abcdefgh12345678", "abcdefgh12345678"),
+                            ("mysql --password=hunter2hunter2 db", "hunter2hunter2")]:
+            hits = self.find(text)
+            self.assertEqual(len(hits), 1, text)
+            self.assertEqual(text[hits[0][0]:hits[0][1]], value, text)
+        self.assertEqual(self.find("API_TOKEN=elkjgroeij434frer")[0][3], "secret-assignment")
+
+    def test_keyword_detection_can_be_turned_off(self):
+        self.cfg["keyword_detection"] = False
+        for text in ["JIRA_PASSWORD=s3cretvalue", "mysql --password=hunter2hunter2 db"]:
+            self.assertFalse(self.find(text), text)
+        ids = [d.id for d in sg.build_detectors(self.cfg)]
+        self.assertNotIn("secret-assignment", ids)
+        self.assertNotIn("cli-password-flag", ids)
+        # generic_detection is independent: the loose rule still covers these on its own.
+        self.cfg["generic_detection"] = True
+        self.assertTrue(self.find("JIRA_PASSWORD=s3cretvalue"))
+        self.assertTrue(self.find("API_TOKEN_PROD=s3cretvalue"))
+
+    def test_keyword_values_that_are_not_secrets(self):
+        for generic in (False, True):
+            self.cfg["generic_detection"] = generic
+            for text in ["token: /var/run/secrets/token", "password=./secrets/pw.txt",
+                         "secret: ~/.config/app/secret", "token = https://auth.example.com/token",
+                         "token = get_token(session)", 'password = os.environ["DB_PASSWORD"]',
+                         "token = args.token", "self.token = response.access_token",
+                         "password=${DB_PASSWORD}", "token: null", "PASSWORD=changeme"]:
+                self.assertFalse(self.find(text), text)
+            # Quoted values are literal strings, whatever they contain.
+            self.assertTrue(self.find('password = "aB3(def)[ghi]{jk}"'))
+            self.assertTrue(self.find("password=12345678"))
+
+    def test_strict_generic_marker_gates_user_patterns(self):
+        with open(os.path.join(self.home, "patterns.json"), "w") as f:
+            json.dump({"patterns": [{"id": "my-strict", "kind": "credential",
+                                     "regex": "pin=(?P<v>\\d{6})", "group": "v", "generic": "strict"}]}, f)
+        self.assertIn("my-strict", [d.id for d in sg.build_detectors(self.cfg)])
+        off = dict(self.cfg, keyword_detection=False, generic_detection=True)
+        self.assertNotIn("my-strict", [d.id for d in sg.build_detectors(off)])
+        with open(os.path.join(self.home, "patterns.json"), "w") as f:
+            json.dump({"patterns": [{"id": "bad", "kind": "x", "regex": "x", "generic": "loose-ish"}]}, f)
+        with self.assertRaises(ValueError):
+            sg.build_detectors(self.cfg)
 
     def test_generic_detection_gates_user_patterns_too(self):
         with open(os.path.join(self.home, "patterns.json"), "w") as f:
@@ -681,8 +730,10 @@ class ProcessIntegration(Base):
         self.assertIn("high-entropy", result.stdout)
         self.assertNotIn(value, result.stdout)
         result = self.run_process(args=["scan", "-"], text="password=hunter2hunter2")
+        self.assertIn("secret-assignment", result.stdout)
+        result = self.run_process(args=["scan", "-"], text="password_old=hunter2hunter2")
         self.assertEqual(result.stdout, "")
-        result = self.run_process(args=["scan", "--generic", "-"], text="password=hunter2hunter2")
+        result = self.run_process(args=["scan", "--generic", "-"], text="password_old=hunter2hunter2")
         self.assertIn("generic-assignment", result.stdout)
         self.assertNotIn("hunter2", result.stdout)
         result = self.run_process(args=["selftest"])

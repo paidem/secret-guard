@@ -1,5 +1,5 @@
 {
-  "_comment": "Built-in detectors. `group` names the capture that is the secret (default: whole match). `flags`: i m s. `generic`: true marks keyword-labelled rules (password=..., --token ...) that only load when config.json has generic_detection: true. Keep this data, not code; add project-specific rules to ~/.claude/secret-guard/patterns.json.",
+  "_comment": "Built-in detectors. `group` names the capture that is the secret (default: whole match). `flags`: i m s. `generic` marks keyword-labelled rules: \"strict\" (the key ends with the keyword: DB_PASSWORD=..., --token ...) loads unless config.json has keyword_detection: false; true (keyword anywhere in the key: API_TOKEN_PROD=..., token_ttl=...) only loads with generic_detection: true. Keep this data, not code; add project-specific rules to ~/.claude/secret-guard/patterns.json.",
   "patterns": [
     {
       "id": "aws-access-key",
@@ -180,7 +180,19 @@
         "v"
       ],
       "flags": "im",
-      "generic": true
+      "generic": "strict"
+    },
+    {
+      "id": "secret-assignment",
+      "kind": "credential",
+      "regex": "(?<![A-Za-z0-9_.-])(?P<k>[A-Za-z0-9_.-]*(?:password|passwd|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|secret[_-]?key|private[_-]?key|auth[_-]?key|credential|client[_-]?secret))[\"']?\\s*(?:=>|[:=])\\s*(?:\"(?P<double>(?:\\\\.|[^\"\\\\]){8,})\"|'(?P<single>[^']{8,})'|(?P<v>[^\\s\"',;&)]{8,}))",
+      "group": [
+        "double",
+        "single",
+        "v"
+      ],
+      "flags": "i",
+      "generic": "strict"
     },
     {
       "id": "generic-assignment",

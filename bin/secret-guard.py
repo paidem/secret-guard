@@ -59,7 +59,8 @@ DEFAULTS = {
     "on_error": "withhold",            # withhold | passthrough
     "max_scan_bytes": 8 * 1024 * 1024,
     "scan_timeout_seconds": 2,
-    "generic_detection": False,        # keyword-labelled values: password=..., --token ...
+    "keyword_detection": True,         # key ends with the keyword: DB_PASSWORD=..., --token ...
+    "generic_detection": False,        # keyword anywhere in the key: API_TOKEN_PROD=...
     "entropy_detection": False,
     "entropy_min_length": 24,
     "entropy_threshold": 4.2,
@@ -119,8 +120,8 @@ def load_config():
         raise ValueError("entropy_min_length must be an integer of at least 8")
     if cfg["entropy_threshold"] > 6 or cfg["entropy_hex_threshold"] > 4:
         raise ValueError("entropy threshold exceeds alphabet capacity")
-    for key in ("builtin_patterns", "log", "generic_detection", "entropy_detection",
-                "entropy_include_hex", "inspect_referenced_files"):
+    for key in ("builtin_patterns", "log", "keyword_detection", "generic_detection",
+                "entropy_detection", "entropy_include_hex", "inspect_referenced_files"):
         if type(cfg[key]) is not bool:
             raise ValueError("invalid boolean setting")
     return cfg
@@ -167,9 +168,18 @@ VALUE_NOISE = re.compile(
     re.IGNORECASE)
 
 
-def value_is_noise(v):
-    """Values the generic rules must not treat as secrets."""
+NOT_A_LITERAL = re.compile(
+    r"[(\[{]|"                                                  # get_token(), os.environ["X"]
+    r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$")    # args.token
+
+
+def value_is_noise(v, quoted=False):
+    """Values the keyword-labelled rules must not treat as secrets."""
     if not v:
+        return True
+    if re.match(r"(?:~|\.{1,2})?/|[A-Za-z][A-Za-z0-9+.-]*://", v):   # a path or URL to the secret
+        return True
+    if not quoted and NOT_A_LITERAL.search(v):                      # code, not a literal value
         return True
     if PLACEHOLDER_RE.fullmatch(v) or re.fullmatch(
             r"\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*|"
@@ -199,7 +209,7 @@ class Detector(object):
                 start, end = m.span(0)
             if start < 0 or end <= start:
                 continue
-            if self.generic and value_is_noise(text[start:end]):
+            if self.generic and value_is_noise(text[start:end], text[start - 1:start] in ("'", '"')):
                 continue
             yield start, end
 
@@ -242,12 +252,14 @@ class EntropyDetector:
 
 
 def build_detectors(cfg, cwd=None):
-    """Detectors flagged `generic` (keyword-labelled values such as `password=...` or
-    `--token ...`) only load when `generic_detection` is on; by default detection relies
-    on vendor prefixes, structure (Bearer, URL credentials, PEM) and the denylist."""
+    """Keyword-labelled detectors come in two tiers. `"generic": "strict"` rules need the
+    key to *be* the keyword (`DB_PASSWORD=...`, `--token ...`) and follow `keyword_detection`,
+    on by default. `"generic": true` rules accept the keyword anywhere in the key
+    (`API_TOKEN_PROD=...`, but also `token_ttl=...`) and follow `generic_detection`, off by
+    default. Everything else - vendor prefixes, structure, the denylist - always loads."""
     dets = []
     disabled = set(cfg.get("disabled_patterns") or [])
-    generic_on = bool(cfg.get("generic_detection"))
+    tier_on = {"strict": bool(cfg.get("keyword_detection")), True: bool(cfg.get("generic_detection"))}
 
     def add_pattern_file(path, required=False):
         data = load_json(path, None)
@@ -258,7 +270,10 @@ def build_detectors(cfg, cwd=None):
         for p in (data.get("patterns") or []):
             if not isinstance(p, dict) or not all(isinstance(p.get(k), str) for k in ("id", "kind", "regex")):
                 raise ValueError("invalid detector definition")
-            if p.get("id") in disabled or (p.get("generic") and not generic_on):
+            tier = p.get("generic") or None
+            if tier is not None and not (tier is True or tier == "strict"):
+                raise ValueError("invalid detector generic marker")
+            if p.get("id") in disabled or (tier is not None and not tier_on[tier]):
                 continue
             flags = 0
             for ch in (p.get("flags") or ""):
@@ -1084,7 +1099,8 @@ def cli_selftest():
     samples = [
         ("glpat-abcdefghijklmnopqrst", True),
         ("AKIAIOSFODNN7EXAMPLE", False),
-        ("password=hunter2hunter2", cfg["generic_detection"]),
+        ("password=hunter2hunter2", cfg["keyword_detection"] or cfg["generic_detection"]),
+        ("password_ttl=3600seconds", cfg["generic_detection"]),
         ("password=${DB_PASSWORD}", False),
         ("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcdefghijklmnop", True),
         ("ssh -p 2222 root@host", False),
