@@ -319,17 +319,21 @@ def allowed(value, allowlist):
     return False
 
 
+def distinctive(value):
+    """Vault values are matched anywhere, without context. A short or plain-word value
+    (a dev password equal to the project name) would then hit every mention of that word."""
+    return len(value) >= 8 and not re.fullmatch(r"[a-z]+|[A-Z]+|[0-9]+", value)
+
+
 def find_secrets(text, detectors, allowlist, known_values=()):
     """-> list of (start, end, kind, detector_id), non-overlapping, ascending."""
     hits = []
     known_hits = []
     for value in known_values:
-        if not value or allowed(value, allowlist):
+        if not value or not distinctive(value) or allowed(value, allowlist):
             continue
-        start = text.find(value)
-        while start >= 0:
-            known_hits.append((start, start + len(value), "known-secret", "vault"))
-            start = text.find(value, start + 1)
+        for m in re.finditer(r"(?<![A-Za-z0-9])%s(?![A-Za-z0-9])" % re.escape(value), text):
+            known_hits.append((m.start(), m.end(), "known-secret", "vault"))
     for d in detectors:
         for start, end in d.find(text):
             val = text[start:end]

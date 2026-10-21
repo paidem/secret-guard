@@ -291,6 +291,12 @@ class RoundTrip(Base):
         prompt = self.hook({"hook_event_name": "UserPromptSubmit", "session_id": SID_A, "prompt": secret})
         self.assertEqual(prompt["decision"], "block")
 
+    def test_weak_known_value_does_not_block_word_mentions(self):
+        hits = sg.find_secrets("insoft/cryreg/cryreg-portal:0.1.0 and cryreg-probe", [], [], ["cryreg"])
+        self.assertEqual(hits, [])
+        self.assertEqual(sg.find_secrets("x-cryreg1234-y", [], [], ["cryreg1234"])[0][2], "known-secret")
+        self.assertEqual(sg.find_secrets("xcryreg1234", [], [], ["cryreg1234"]), [])
+
     def test_discovery_is_independent_of_field_order(self):
         self.enable_generic()
         secret = "CorrectHorseBatteryStaple9!"
